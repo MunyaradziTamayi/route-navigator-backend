@@ -1,0 +1,23 @@
+spring:
+  application:
+    name: route-navigator
+
+  r2dbc:
+    url: r2dbc:postgresql://localhost:5432/routenav
+    username: postgres
+    password: admin
+
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema.sql
+
+server:
+  port: 8080
+
+osrm:
+  base-url: http://router.project-osrm.org
+
+nominatim:
+  base-url: https://nominatim.openstreetmap.org
+
