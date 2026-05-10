@@ -3,9 +3,9 @@ spring:
     name: route-navigator
 
   r2dbc:
-    url: r2dbc:postgresql://localhost:5432/routenav
-    username: postgres
-    password: admin
+    url: r2dbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:routenavs}
+    username: ${SPRING_R2DBC_USERNAME:postgres}
+    password: ${SPRING_R2DBC_PASSWORD:admin}
 
   sql:
     init:
@@ -13,7 +13,7 @@ spring:
       schema-locations: classpath:schema.sql
 
 server:
-  port: 8080
+  port: ${PORT:8080}
 
 osrm:
   base-url: http://router.project-osrm.org

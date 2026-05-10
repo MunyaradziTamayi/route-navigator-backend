@@ -1,0 +1,38 @@
+services:
+  - type: web
+    name: route-navigator-backend
+    env: docker
+    region: oregon
+    plan: free
+    branch: main
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: PORT
+        value: 8080
+      - key: DB_HOST
+        fromDatabase:
+          name: routenav-db
+          property: host
+      - key: DB_PORT
+        fromDatabase:
+          name: routenav-db
+          property: port
+      - key: DB_NAME
+        fromDatabase:
+          name: routenav-db
+          property: database
+      - key: SPRING_R2DBC_USERNAME
+        fromDatabase:
+          name: routenav-db
+          property: user
+      - key: SPRING_R2DBC_PASSWORD
+        fromDatabase:
+          name: routenav-db
+          property: password
+
+databases:
+  - name: routenav-db
+    databaseName: routenavs
+    user: routenav_user
+    plan: free
+    region: oregon

@@ -1,0 +1,19 @@
+package com.routenav.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class WorkerRequest {
+
+    private String name;
+    private String email;
+    private String phone;
+    private String area;
+    private String homeAddress;
+}
