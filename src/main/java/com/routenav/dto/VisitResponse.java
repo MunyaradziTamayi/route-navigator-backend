@@ -32,6 +32,7 @@ public class VisitResponse {
     private String clientLabel;
     private String notes;
     private LocalDateTime scheduledDate;
+    private String status;
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
 }

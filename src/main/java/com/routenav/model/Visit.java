@@ -36,6 +36,7 @@ public class Visit {
     private Double distanceKm;
     private Integer durationSeconds;
     private String geometry;
+    private String status;
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
 }

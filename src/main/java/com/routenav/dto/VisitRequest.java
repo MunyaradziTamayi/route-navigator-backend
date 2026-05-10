@@ -38,6 +38,7 @@ public class VisitRequest {
     private String clientLabel;
     private String notes;
     private LocalDateTime scheduledDate;
+    private String status;
 
     @NotNull
     private Double distanceKm;

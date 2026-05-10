@@ -32,12 +32,14 @@ CREATE TABLE IF NOT EXISTS visits (
     duration_seconds  INTEGER,
     geometry          TEXT,
     created_at        TIMESTAMP DEFAULT NOW(),
-    updated_at        TIMESTAMP DEFAULT NOW()
+    updated_at        TIMESTAMP DEFAULT NOW(),
+    status            VARCHAR(255) DEFAULT 'pending'
 );
 
 ALTER TABLE visits ADD COLUMN IF NOT EXISTS client_label VARCHAR(500);
 ALTER TABLE visits ADD COLUMN IF NOT EXISTS notes TEXT;
 ALTER TABLE visits ADD COLUMN IF NOT EXISTS scheduled_date TIMESTAMP;
+ALTER TABLE visits ADD COLUMN IF NOT EXISTS status VARCHAR(255) DEFAULT 'pending';
 
 CREATE TABLE IF NOT EXISTS workers (
     id               BIGSERIAL PRIMARY KEY,

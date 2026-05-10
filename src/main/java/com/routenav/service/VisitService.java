@@ -68,6 +68,7 @@ public class VisitService {
                 .distanceKm(request.getDistanceKm())
                 .durationSeconds(request.getDurationSeconds())
                 .geometry(toJson(request.getGeoJson()))
+                .status(request.getStatus() == null ? "pending" : request.getStatus())
                 .createdAt(createdAt)
                 .updatedAt(updatedAt)
                 .build();
@@ -93,6 +94,7 @@ public class VisitService {
                 .clientLabel(visit.getClientLabel())
                 .notes(visit.getNotes())
                 .scheduledDate(visit.getScheduledDate())
+                .status(visit.getStatus())
                 .createdAt(visit.getCreatedAt())
                 .updatedAt(visit.getUpdatedAt())
                 .build();
