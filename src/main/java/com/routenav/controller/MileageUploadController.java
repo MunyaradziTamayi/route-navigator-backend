@@ -34,8 +34,11 @@ public class MileageUploadController {
     private final MileageUploadService mileageUploadService;
 
     @PostMapping(value = "/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public Mono<ResponseEntity<Object>> upload(@RequestPart("file") FilePart file) {
-        return mileageUploadService.calculateMonthlyMileageReports(file)
+    public Mono<ResponseEntity<Object>> upload(
+            @RequestPart("file") FilePart file,
+            @RequestParam(required = false) String month,
+            @RequestParam(required = false) Integer year) {
+        return mileageUploadService.calculateMonthlyMileageReports(file, month, year)
                 .map(reports -> ResponseEntity.ok((Object) reports))
                 .onErrorResume(IllegalArgumentException.class, e -> Mono.just(ResponseEntity.badRequest()
                         .body(ErrorResponse.builder().message(e.getMessage()).build())))

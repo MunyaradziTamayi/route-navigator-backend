@@ -84,11 +84,13 @@ public class MileageUploadService {
         this.visitRepository = visitRepository;
     }
 
-    public Mono<List<WorkerMileageReportResponse>> calculateMonthlyMileageReports(FilePart file) {
+    public Mono<List<WorkerMileageReportResponse>> calculateMonthlyMileageReports(FilePart file, String reportMonth, Integer year) {
+        ReportMonthFilter filter = parseReportMonthFilter(reportMonth, year);
         return DataBufferUtils.join(file.content())
                 .map(this::toBytes)
                 .flatMap(bytes -> Mono.fromCallable(() -> parseVisits(bytes))
                         .subscribeOn(Schedulers.boundedElastic()))
+                .map(visits -> filterVisitsByReportMonth(visits, filter))
                 .flatMapMany(visits -> Flux.fromIterable(groupVisitsByMonth(visits).entrySet()))
                 .concatMap(entry -> geocodeVisits(entry.getValue())
                         .flatMap(this::calculateMileage)
@@ -296,6 +298,26 @@ public class MileageUploadService {
         return visitsByMonth;
     }
 
+    private List<VisitRow> filterVisitsByReportMonth(List<VisitRow> visits, ReportMonthFilter filter) {
+        if (filter == null) {
+            return visits;
+        }
+
+        return visits.stream()
+                .filter(visit -> visitMatchesFilter(YearMonth.from(visit.visitDateTime()), filter))
+                .toList();
+    }
+
+    private boolean visitMatchesFilter(YearMonth visitMonth, ReportMonthFilter filter) {
+        if (filter.exactReportMonth() != null) {
+            return visitMonth.toString().equals(filter.exactReportMonth());
+        }
+        if (filter.year() != null && visitMonth.getYear() != filter.year()) {
+            return false;
+        }
+        return filter.month() == null || visitMonth.getMonthValue() == filter.month();
+    }
+
     private String reportMonth(YearMonth yearMonth) {
         return yearMonth.toString();
     }
@@ -318,8 +340,13 @@ public class MileageUploadService {
             return new ReportMonthFilter(exact, year, month);
         }
 
+        Optional<Integer> monthOnly = parseMonthValue(monthText);
+        if (monthOnly.isPresent()) {
+            return new ReportMonthFilter(null, null, monthOnly.get());
+        }
+
         ParsedMonthYear parsed = parseMonthYear(monthText)
-                .orElseThrow(() -> new IllegalArgumentException("Use a month and year, for example: May 2026."));
+                .orElseThrow(() -> new IllegalArgumentException("Use a month name, year, or both, for example: March 2026."));
         return new ReportMonthFilter(YearMonth.of(parsed.year(), parsed.month()).toString(), parsed.year(), parsed.month());
     }
 
