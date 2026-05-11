@@ -19,4 +19,5 @@ public class WorkerMileageReportResponse {
     private String downloadUrl;
     private LocalDateTime createdAt;
     private List<WorkerMileageReportRowResponse> rows;
+    private List<WorkerMileageVisitResponse> visits;
 }

@@ -2,10 +2,13 @@ package com.routenav.service;
 
 import com.routenav.dto.WorkerMileageReportResponse;
 import com.routenav.dto.WorkerMileageReportRowResponse;
+import com.routenav.dto.WorkerMileageVisitResponse;
 import com.routenav.model.WorkerMileageReport;
 import com.routenav.model.WorkerMileageReportRow;
+import com.routenav.model.WorkerMileageVisit;
 import com.routenav.repository.WorkerMileageReportRepository;
 import com.routenav.repository.WorkerMileageReportRowRepository;
+import com.routenav.repository.WorkerMileageVisitRepository;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -64,14 +67,18 @@ public class MileageUploadService {
 
     private final WorkerMileageReportRowRepository reportRowRepository;
 
+    private final WorkerMileageVisitRepository visitRepository;
+
     public MileageUploadService(GeocodingService geocodingService,
                                 RoutingService routingService,
                                 WorkerMileageReportRepository reportRepository,
-                                WorkerMileageReportRowRepository reportRowRepository) {
+                                WorkerMileageReportRowRepository reportRowRepository,
+                                WorkerMileageVisitRepository visitRepository) {
         this.geocodingService = geocodingService;
         this.routingService = routingService;
         this.reportRepository = reportRepository;
         this.reportRowRepository = reportRowRepository;
+        this.visitRepository = visitRepository;
     }
 
     public Mono<WorkerMileageReportResponse> calculateMonthlyMileageReport(FilePart file) {
@@ -79,10 +86,11 @@ public class MileageUploadService {
                 .map(this::toBytes)
                 .flatMap(bytes -> Mono.fromCallable(() -> parseVisits(bytes))
                         .subscribeOn(Schedulers.boundedElastic()))
-                .flatMap(visits -> calculateMileage(visits)
+                .flatMap(visits -> geocodeVisits(visits)
+                        .flatMap(this::calculateMileage)
                         .flatMap(results -> Mono.fromCallable(() -> buildWorkbook(results))
                                 .subscribeOn(Schedulers.boundedElastic())
-                                .flatMap(workbook -> saveReport(reportMonth(visits), results, workbook))));
+                                .flatMap(workbook -> saveReport(reportMonth(visits), visits, results, workbook))));
     }
 
     public Flux<WorkerMileageReportResponse> listReports(String reportMonth) {
@@ -98,6 +106,11 @@ public class MileageUploadService {
 
     public Mono<WorkerMileageReport> getReportFile(Long reportId) {
         return reportRepository.findById(reportId);
+    }
+
+    public Flux<WorkerMileageVisitResponse> getVisitsByStaffNumber(String staffNumber) {
+        return visitRepository.findByStaffNumberOrderByVisitDateDescStartTimeDesc(staffNumber)
+                .map(this::toVisitResponse);
     }
 
     private byte[] toBytes(DataBuffer dataBuffer) {
@@ -128,13 +141,13 @@ public class MileageUploadService {
                 String staffNumber = getText(row, columns.get("staff number"), formatter);
                 String address = getText(row, columns.get("address"), formatter);
                 LocalDate date = parseDate(row.getCell(columns.get("date")), formatter);
-                LocalTime visitTime = parseTime(row.getCell(columns.get("visit time")), formatter);
+                TimeRange visitTime = parseTimeRange(row.getCell(columns.get("visit time")), formatter);
 
                 if (staffNumber.isBlank() || address.isBlank()) {
                     throw new IllegalArgumentException("Row " + (i + 1) + " must include Staff Number and Address.");
                 }
 
-                visits.add(new VisitRow(staffNumber, LocalDateTime.of(date, visitTime), address));
+                visits.add(new VisitRow(staffNumber, LocalDateTime.of(date, visitTime.startTime()), date, visitTime.startTime(), visitTime.endTime(), address, null, null));
             }
 
             if (visits.isEmpty()) {
@@ -201,41 +214,59 @@ public class MileageUploadService {
         throw new IllegalArgumentException("Invalid date value: " + value);
     }
 
-    private LocalTime parseTime(Cell cell, DataFormatter formatter) {
+    private TimeRange parseTimeRange(Cell cell, DataFormatter formatter) {
         if (cell == null) {
             throw new IllegalArgumentException("Visit Time is required.");
         }
 
         if (cell.getCellType() == CellType.NUMERIC) {
+            LocalTime time;
             if (DateUtil.isCellDateFormatted(cell)) {
-                return cell.getLocalDateTimeCellValue().toLocalTime();
+                time = cell.getLocalDateTimeCellValue().toLocalTime();
+            } else {
+                int seconds = (int) Math.round(cell.getNumericCellValue() * 24 * 60 * 60);
+                time = LocalTime.ofSecondOfDay(Math.floorMod(seconds, 24 * 60 * 60));
             }
-            int seconds = (int) Math.round(cell.getNumericCellValue() * 24 * 60 * 60);
-            return LocalTime.ofSecondOfDay(Math.floorMod(seconds, 24 * 60 * 60));
+            return new TimeRange(time, null);
         }
 
         String value = formatter.formatCellValue(cell).trim().toUpperCase(Locale.ENGLISH);
-        String startTime = value.split("\\s*-\\s*", 2)[0].trim();
+        String[] parts = value.split("\\s*-\\s*", 2);
+        LocalTime startTime = parseTimeText(parts[0].trim(), value);
+        LocalTime endTime = parts.length > 1 && !parts[1].trim().isBlank()
+                ? parseTimeText(parts[1].trim(), value)
+                : null;
+        return new TimeRange(startTime, endTime);
+    }
+
+    private LocalTime parseTimeText(String value, String originalValue) {
         for (DateTimeFormatter timeFormatter : TIME_FORMATTERS) {
             try {
-                return LocalTime.parse(startTime, timeFormatter);
+                return LocalTime.parse(value, timeFormatter);
             } catch (DateTimeParseException ignored) {
                 // Try the next supported format.
             }
         }
 
-        throw new IllegalArgumentException("Invalid visit time value: " + value);
+        throw new IllegalArgumentException("Invalid visit time value: " + originalValue);
+    }
+
+    private Mono<List<VisitRow>> geocodeVisits(List<VisitRow> visits) {
+        Map<String, Mono<Location>> addressCache = new HashMap<>();
+        return Flux.fromIterable(visits)
+                .concatMap(visit -> geocode(visit, addressCache)
+                        .map(location -> visit.withLocation(location.lat(), location.lon())))
+                .collectList();
     }
 
     private Mono<List<MileageResult>> calculateMileage(List<VisitRow> visits) {
         Map<String, List<VisitRow>> visitsByStaff = new LinkedHashMap<>();
-        Map<String, Mono<Location>> addressCache = new HashMap<>();
         for (VisitRow visit : visits) {
             visitsByStaff.computeIfAbsent(visit.staffNumber(), ignored -> new ArrayList<>()).add(visit);
         }
 
         return Flux.fromIterable(visitsByStaff.entrySet())
-                .concatMap(entry -> calculateStaffMileage(entry.getKey(), entry.getValue(), addressCache))
+                .concatMap(entry -> calculateStaffMileage(entry.getKey(), entry.getValue()))
                 .collectList();
     }
 
@@ -247,13 +278,15 @@ public class MileageUploadService {
         return yearMonth.toString();
     }
 
-    private Mono<MileageResult> calculateStaffMileage(String staffNumber, List<VisitRow> visits, Map<String, Mono<Location>> addressCache) {
+    private Mono<MileageResult> calculateStaffMileage(String staffNumber, List<VisitRow> visits) {
         visits.sort(Comparator.comparing(VisitRow::visitDateTime));
 
-        return Flux.fromIterable(visits)
-                .concatMap(visit -> geocode(visit, addressCache))
-                .collectList()
-                .flatMap(locations -> calculateLocationDistances(staffNumber, locations));
+        List<Location> locations = visits.stream()
+                .filter(visit -> visit.lat() != null && visit.lon() != null)
+                .map(visit -> new Location(visit.lat(), visit.lon()))
+                .toList();
+
+        return calculateLocationDistances(staffNumber, locations);
     }
 
     private Mono<Location> geocode(VisitRow visit, Map<String, Mono<Location>> addressCache) {
@@ -303,7 +336,7 @@ public class MileageUploadService {
         }
     }
 
-    private Mono<WorkerMileageReportResponse> saveReport(String reportMonth, List<MileageResult> results, byte[] workbook) {
+    private Mono<WorkerMileageReportResponse> saveReport(String reportMonth, List<VisitRow> visits, List<MileageResult> results, byte[] workbook) {
         WorkerMileageReport report = WorkerMileageReport.builder()
                 .reportMonth(reportMonth)
                 .fileName("worker-mileage-" + reportMonth + ".xlsx")
@@ -312,34 +345,90 @@ public class MileageUploadService {
                 .build();
 
         return reportRepository.save(report)
-                .flatMap(saved -> Flux.fromIterable(results)
-                        .map(result -> WorkerMileageReportRow.builder()
-                                .reportId(saved.getId())
-                                .staffNumber(result.staffNumber())
-                                .totalMileage(Math.round(result.totalMileageKm() * 100.0) / 100.0)
-                                .build())
-                        .flatMap(reportRowRepository::save)
+                .flatMap(saved -> saveReportRows(saved.getId(), results)
+                        .then(saveReportVisits(saved.getId(), visits))
                         .then(toReportResponse(saved)));
     }
 
+    private Mono<Void> saveReportRows(Long reportId, List<MileageResult> results) {
+        return Flux.fromIterable(results)
+                .map(result -> WorkerMileageReportRow.builder()
+                        .reportId(reportId)
+                        .staffNumber(result.staffNumber())
+                        .totalMileage(Math.round(result.totalMileageKm() * 100.0) / 100.0)
+                        .build())
+                .flatMap(reportRowRepository::save)
+                .then();
+    }
+
+    private Mono<Void> saveReportVisits(Long reportId, List<VisitRow> visits) {
+        LocalDateTime now = LocalDateTime.now();
+        return Flux.fromIterable(visits)
+                .map(visit -> WorkerMileageVisit.builder()
+                        .reportId(reportId)
+                        .staffNumber(visit.staffNumber())
+                        .visitDate(visit.visitDate())
+                        .startTime(visit.startTime())
+                        .endTime(visit.endTime())
+                        .address(visit.address())
+                        .lat(visit.lat())
+                        .lon(visit.lon())
+                        .createdAt(now)
+                        .build())
+                .flatMap(visitRepository::save)
+                .then();
+    }
+
     private Mono<WorkerMileageReportResponse> toReportResponse(WorkerMileageReport report) {
-        return reportRowRepository.findByReportIdOrderByStaffNumberAsc(report.getId())
+        Mono<List<WorkerMileageReportRowResponse>> rows = reportRowRepository.findByReportIdOrderByStaffNumberAsc(report.getId())
                 .map(row -> WorkerMileageReportRowResponse.builder()
                         .staffNumber(row.getStaffNumber())
                         .totalMileage(row.getTotalMileage())
                         .build())
-                .collectList()
-                .map(rows -> WorkerMileageReportResponse.builder()
+                .collectList();
+        Mono<List<WorkerMileageVisitResponse>> visits = visitRepository.findByReportIdOrderByStaffNumberAscVisitDateAscStartTimeAsc(report.getId())
+                .map(this::toVisitResponse)
+                .collectList();
+
+        return Mono.zip(rows, visits)
+                .map(tuple -> WorkerMileageReportResponse.builder()
                         .id(report.getId())
                         .reportMonth(report.getReportMonth())
                         .fileName(report.getFileName())
                         .downloadUrl("/api/mileage/reports/" + report.getId() + "/download")
                         .createdAt(report.getCreatedAt())
-                        .rows(rows)
+                        .rows(tuple.getT1())
+                        .visits(tuple.getT2())
                         .build());
     }
 
-    private record VisitRow(String staffNumber, LocalDateTime visitDateTime, String address) {
+    private WorkerMileageVisitResponse toVisitResponse(WorkerMileageVisit visit) {
+        return WorkerMileageVisitResponse.builder()
+                .id(visit.getId())
+                .reportId(visit.getReportId())
+                .staffNumber(visit.getStaffNumber())
+                .visitDate(visit.getVisitDate())
+                .startTime(visit.getStartTime())
+                .endTime(visit.getEndTime())
+                .address(visit.getAddress())
+                .lat(visit.getLat())
+                .lon(visit.getLon())
+                .build();
+    }
+
+    private record VisitRow(
+            String staffNumber,
+            LocalDateTime visitDateTime,
+            LocalDate visitDate,
+            LocalTime startTime,
+            LocalTime endTime,
+            String address,
+            Double lat,
+            Double lon
+    ) {
+        private VisitRow withLocation(Double lat, Double lon) {
+            return new VisitRow(staffNumber, visitDateTime, visitDate, startTime, endTime, address, lat, lon);
+        }
     }
 
     private record Location(double lat, double lon) {
@@ -349,5 +438,8 @@ public class MileageUploadService {
     }
 
     private record MileageResult(String staffNumber, double totalMileageKm) {
+    }
+
+    private record TimeRange(LocalTime startTime, LocalTime endTime) {
     }
 }

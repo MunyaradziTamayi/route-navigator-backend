@@ -2,6 +2,7 @@ package com.routenav.controller;
 
 import com.routenav.dto.ErrorResponse;
 import com.routenav.dto.WorkerMileageReportResponse;
+import com.routenav.dto.WorkerMileageVisitResponse;
 import com.routenav.model.WorkerMileageReport;
 import com.routenav.service.MileageUploadService;
 import lombok.RequiredArgsConstructor;
@@ -52,6 +53,11 @@ public class MileageUploadController {
         return mileageUploadService.getReport(id)
                 .map(ResponseEntity::ok)
                 .defaultIfEmpty(ResponseEntity.notFound().build());
+    }
+
+    @GetMapping("/visits/staff/{staffNumber}")
+    public Flux<WorkerMileageVisitResponse> getVisitsByStaffNumber(@PathVariable String staffNumber) {
+        return mileageUploadService.getVisitsByStaffNumber(staffNumber);
     }
 
     @GetMapping("/reports/{id}/download")

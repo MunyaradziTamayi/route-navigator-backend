@@ -76,8 +76,27 @@ CREATE TABLE IF NOT EXISTS worker_mileage_report_rows (
     total_mileage   DOUBLE PRECISION NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS worker_mileage_visits (
+    id              BIGSERIAL PRIMARY KEY,
+    report_id       BIGINT REFERENCES worker_mileage_reports(id) ON DELETE CASCADE,
+    staff_number    VARCHAR(100) NOT NULL,
+    visit_date      DATE NOT NULL,
+    start_time      TIME,
+    end_time        TIME,
+    address         VARCHAR(1000) NOT NULL,
+    lat             DOUBLE PRECISION,
+    lon             DOUBLE PRECISION,
+    created_at      TIMESTAMP DEFAULT NOW()
+);
+
 CREATE INDEX IF NOT EXISTS idx_worker_mileage_reports_month
     ON worker_mileage_reports (report_month, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_worker_mileage_report_rows_report_id
     ON worker_mileage_report_rows (report_id, staff_number);
+
+CREATE INDEX IF NOT EXISTS idx_worker_mileage_visits_staff_number
+    ON worker_mileage_visits (staff_number, visit_date DESC, start_time DESC);
+
+CREATE INDEX IF NOT EXISTS idx_worker_mileage_visits_report_id
+    ON worker_mileage_visits (report_id, staff_number, visit_date, start_time);
