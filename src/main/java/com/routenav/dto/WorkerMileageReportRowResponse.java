@@ -13,4 +13,5 @@ public class WorkerMileageReportRowResponse {
 
     private String staffNumber;
     private Double totalMileage;
+    private Double totalStraightLineMileage;
 }

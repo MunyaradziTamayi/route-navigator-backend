@@ -144,6 +144,7 @@ public class RoutingService {
                         .originName(route.getOriginName())
                         .destinationName(route.getDestinationName())
                         .distanceKm(route.getDistanceKm())
+                        .straightLineDistanceKm(straightLineDistanceKm(route))
                         .duration(formatDuration(route.getDurationSeconds() == null ? 0 : route.getDurationSeconds()))
                         .geometry(route.getGeometry())
                         .instructions(List.of())
@@ -158,6 +159,7 @@ public class RoutingService {
                         .originLabel(route.getOriginName())
                         .destinationLabel(route.getDestinationName())
                         .distanceKm(route.getDistanceKm() == null ? 0.0 : route.getDistanceKm())
+                        .straightLineDistanceKm(straightLineDistanceKm(route))
                         .createdAt(route.getCreatedAt() == null ? "" : route.getCreatedAt().toString())
                         .build());
     }
@@ -170,6 +172,7 @@ public class RoutingService {
             return Mono.just(ComputeRouteResponse.builder()
                     .geoJson(null)
                     .distanceKm(0.0)
+                    .straightLineDistanceKm(0.0)
                     .durationSeconds(0)
                     .build());
         }
@@ -188,12 +191,14 @@ public class RoutingService {
                     return ComputeRouteResponse.builder()
                             .geoJson(geoJson)
                             .distanceKm(route.getDistanceKm() == null ? 0.0 : route.getDistanceKm())
+                            .straightLineDistanceKm(straightLineDistanceKm(route))
                             .durationSeconds(route.getDurationSeconds() == null ? 0 : route.getDurationSeconds())
                             .build();
                 })
                 .defaultIfEmpty(ComputeRouteResponse.builder()
                         .geoJson(null)
                         .distanceKm(0.0)
+                        .straightLineDistanceKm(0.0)
                         .durationSeconds(0)
                         .build());
     }
@@ -230,6 +235,7 @@ public class RoutingService {
                 .originName(route.getOriginName())
                 .destinationName(route.getDestinationName())
                 .distanceKm(route.getDistanceKm())
+                .straightLineDistanceKm(straightLineDistanceKm(route))
                 .duration(formatDuration(route.getDurationSeconds() == null ? 0 : route.getDurationSeconds()))
                 .geometry(route.getGeometry())
                 .instructions(List.of())
@@ -246,9 +252,32 @@ public class RoutingService {
             return ComputeRouteResponse.builder()
                     .geoJson(geoJson)
                     .distanceKm(route.getDistanceKm())
+                    .straightLineDistanceKm(straightLineDistanceKm(route))
                     .durationSeconds(route.getDurationSeconds())
                     .build();
         });
+    }
+
+    private double straightLineDistanceKm(Route route) {
+        if (route.getOriginLat() == null || route.getOriginLon() == null
+                || route.getDestinationLat() == null || route.getDestinationLon() == null) {
+            return 0.0;
+        }
+        return haversineDistanceKm(route.getOriginLat(), route.getOriginLon(), route.getDestinationLat(), route.getDestinationLon());
+    }
+
+    private double haversineDistanceKm(double originLat, double originLon, double destinationLat, double destinationLon) {
+        final double earthRadiusKm = 6371.0088;
+        double latDistance = Math.toRadians(destinationLat - originLat);
+        double lonDistance = Math.toRadians(destinationLon - originLon);
+        double originLatRadians = Math.toRadians(originLat);
+        double destinationLatRadians = Math.toRadians(destinationLat);
+
+        double a = Math.sin(latDistance / 2) * Math.sin(latDistance / 2)
+                + Math.cos(originLatRadians) * Math.cos(destinationLatRadians)
+                * Math.sin(lonDistance / 2) * Math.sin(lonDistance / 2);
+        double c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+        return earthRadiusKm * c;
     }
 
     private String formatDuration(int seconds) {

@@ -15,6 +15,6 @@ public class JourneySummaryResponse {
     private String originLabel;
     private String destinationLabel;
     private Double distanceKm;
+    private Double straightLineDistanceKm;
     private String createdAt;
 }
-

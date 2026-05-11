@@ -27,6 +27,7 @@ public class VisitResponse {
     private LocalTime endTime;
     private Integer visitsPerDay;
     private Double distanceKm;
+    private Double straightLineDistanceKm;
     private Integer durationSeconds;
     private Object geoJson;
     private String clientLabel;

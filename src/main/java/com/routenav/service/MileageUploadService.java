@@ -417,13 +417,16 @@ public class MileageUploadService {
 
     private Mono<MileageResult> calculateLocationDistances(String staffNumber, List<Location> locations) {
         if (locations.size() < 2) {
-            return Mono.just(new MileageResult(staffNumber, 0.0));
+            return Mono.just(new MileageResult(staffNumber, 0.0, 0.0));
         }
 
         List<RoutePair> pairs = new ArrayList<>();
         for (int i = 1; i < locations.size(); i++) {
             pairs.add(new RoutePair(locations.get(i - 1), locations.get(i)));
         }
+        double totalStraightLineMileageKm = pairs.stream()
+                .mapToDouble(pair -> straightLineDistanceKm(pair.origin(), pair.destination()))
+                .sum();
 
         return Flux.fromIterable(pairs)
                 .concatMap(pair -> routingService.calculateDistanceKm(
@@ -432,7 +435,52 @@ public class MileageUploadService {
                         pair.destination().lat(),
                         pair.destination().lon()))
                 .reduce(0.0, Double::sum)
-                .map(total -> new MileageResult(staffNumber, total));
+                .map(total -> new MileageResult(staffNumber, total, totalStraightLineMileageKm));
+    }
+
+    private Map<String, Double> straightLineMileageByStaff(List<WorkerMileageVisit> visits) {
+        Map<String, List<WorkerMileageVisit>> visitsByStaff = new LinkedHashMap<>();
+        for (WorkerMileageVisit visit : visits) {
+            visitsByStaff.computeIfAbsent(visit.getStaffNumber(), ignored -> new ArrayList<>()).add(visit);
+        }
+
+        Map<String, Double> totals = new HashMap<>();
+        for (Map.Entry<String, List<WorkerMileageVisit>> entry : visitsByStaff.entrySet()) {
+            List<Location> locations = entry.getValue().stream()
+                    .sorted(Comparator.comparing(WorkerMileageVisit::getVisitDate)
+                            .thenComparing(WorkerMileageVisit::getStartTime, Comparator.nullsLast(Comparator.naturalOrder())))
+                    .filter(visit -> visit.getLat() != null && visit.getLon() != null)
+                    .map(visit -> new Location(visit.getLat(), visit.getLon()))
+                    .toList();
+            totals.put(entry.getKey(), totalStraightLineMileageKm(locations));
+        }
+        return totals;
+    }
+
+    private double totalStraightLineMileageKm(List<Location> locations) {
+        double total = 0.0;
+        for (int i = 1; i < locations.size(); i++) {
+            total += straightLineDistanceKm(locations.get(i - 1), locations.get(i));
+        }
+        return total;
+    }
+
+    private double straightLineDistanceKm(Location origin, Location destination) {
+        final double earthRadiusKm = 6371.0088;
+        double latDistance = Math.toRadians(destination.lat() - origin.lat());
+        double lonDistance = Math.toRadians(destination.lon() - origin.lon());
+        double originLatRadians = Math.toRadians(origin.lat());
+        double destinationLatRadians = Math.toRadians(destination.lat());
+
+        double a = Math.sin(latDistance / 2) * Math.sin(latDistance / 2)
+                + Math.cos(originLatRadians) * Math.cos(destinationLatRadians)
+                * Math.sin(lonDistance / 2) * Math.sin(lonDistance / 2);
+        double c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+        return earthRadiusKm * c;
+    }
+
+    private double roundMileage(double mileage) {
+        return Math.round(mileage * 100.0) / 100.0;
     }
 
     private byte[] buildWorkbook(List<MileageResult> results) throws IOException {
@@ -440,17 +488,20 @@ public class MileageUploadService {
             Sheet sheet = workbook.createSheet("Mileage Results");
             Row header = sheet.createRow(0);
             header.createCell(0).setCellValue("Staff Number");
-            header.createCell(1).setCellValue("Total Mileage");
+            header.createCell(1).setCellValue("Total Driving Mileage");
+            header.createCell(2).setCellValue("Total Straight-Line Mileage");
 
             for (int i = 0; i < results.size(); i++) {
                 MileageResult result = results.get(i);
                 Row row = sheet.createRow(i + 1);
                 row.createCell(0).setCellValue(result.staffNumber());
-                row.createCell(1).setCellValue(Math.round(result.totalMileageKm() * 100.0) / 100.0);
+                row.createCell(1).setCellValue(roundMileage(result.totalMileageKm()));
+                row.createCell(2).setCellValue(roundMileage(result.totalStraightLineMileageKm()));
             }
 
             sheet.autoSizeColumn(0);
             sheet.autoSizeColumn(1);
+            sheet.autoSizeColumn(2);
             workbook.write(outputStream);
             return outputStream.toByteArray();
         }
@@ -475,7 +526,7 @@ public class MileageUploadService {
                 .map(result -> WorkerMileageReportRow.builder()
                         .reportId(reportId)
                         .staffNumber(result.staffNumber())
-                        .totalMileage(Math.round(result.totalMileageKm() * 100.0) / 100.0)
+                        .totalMileage(roundMileage(result.totalMileageKm()))
                         .build())
                 .flatMap(reportRowRepository::save)
                 .then();
@@ -500,26 +551,35 @@ public class MileageUploadService {
     }
 
     private Mono<WorkerMileageReportResponse> toReportResponse(WorkerMileageReport report) {
-        Mono<List<WorkerMileageReportRowResponse>> rows = reportRowRepository.findByReportIdOrderByStaffNumberAsc(report.getId())
-                .map(row -> WorkerMileageReportRowResponse.builder()
-                        .staffNumber(row.getStaffNumber())
-                        .totalMileage(row.getTotalMileage())
-                        .build())
+        Mono<List<WorkerMileageReportRow>> rows = reportRowRepository.findByReportIdOrderByStaffNumberAsc(report.getId())
                 .collectList();
-        Mono<List<WorkerMileageVisitResponse>> visits = visitRepository.findByReportIdOrderByStaffNumberAscVisitDateAscStartTimeAsc(report.getId())
-                .map(this::toVisitResponse)
+        Mono<List<WorkerMileageVisit>> visits = visitRepository.findByReportIdOrderByStaffNumberAscVisitDateAscStartTimeAsc(report.getId())
                 .collectList();
 
         return Mono.zip(rows, visits)
-                .map(tuple -> WorkerMileageReportResponse.builder()
-                        .id(report.getId())
-                        .reportMonth(report.getReportMonth())
-                        .fileName(report.getFileName())
-                        .downloadUrl("/api/mileage/reports/" + report.getId() + "/download")
-                        .createdAt(report.getCreatedAt())
-                        .rows(tuple.getT1())
-                        .visits(tuple.getT2())
-                        .build());
+                .map(tuple -> {
+                    Map<String, Double> straightLineMileageByStaff = straightLineMileageByStaff(tuple.getT2());
+                    List<WorkerMileageReportRowResponse> rowResponses = tuple.getT1().stream()
+                            .map(row -> WorkerMileageReportRowResponse.builder()
+                                    .staffNumber(row.getStaffNumber())
+                                    .totalMileage(row.getTotalMileage())
+                                    .totalStraightLineMileage(roundMileage(straightLineMileageByStaff.getOrDefault(row.getStaffNumber(), 0.0)))
+                                    .build())
+                            .toList();
+                    List<WorkerMileageVisitResponse> visitResponses = tuple.getT2().stream()
+                            .map(this::toVisitResponse)
+                            .toList();
+
+                    return WorkerMileageReportResponse.builder()
+                            .id(report.getId())
+                            .reportMonth(report.getReportMonth())
+                            .fileName(report.getFileName())
+                            .downloadUrl("/api/mileage/reports/" + report.getId() + "/download")
+                            .createdAt(report.getCreatedAt())
+                            .rows(rowResponses)
+                            .visits(visitResponses)
+                            .build();
+                });
     }
 
     private WorkerMileageVisitResponse toVisitResponse(WorkerMileageVisit visit) {
@@ -557,7 +617,7 @@ public class MileageUploadService {
     private record RoutePair(Location origin, Location destination) {
     }
 
-    private record MileageResult(String staffNumber, double totalMileageKm) {
+    private record MileageResult(String staffNumber, double totalMileageKm, double totalStraightLineMileageKm) {
     }
 
     private record TimeRange(LocalTime startTime, LocalTime endTime) {

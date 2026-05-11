@@ -89,6 +89,7 @@ public class VisitService {
                 .endTime(visit.getEndTime())
                 .visitsPerDay(visit.getVisitsPerDay())
                 .distanceKm(visit.getDistanceKm())
+                .straightLineDistanceKm(straightLineDistanceKm(visit))
                 .durationSeconds(visit.getDurationSeconds())
                 .geoJson(fromJsonObject(visit.getGeometry()))
                 .clientLabel(visit.getClientLabel())
@@ -124,5 +125,27 @@ public class VisitService {
         } catch (Exception e) {
             return null;
         }
+    }
+
+    private double straightLineDistanceKm(Visit visit) {
+        if (visit.getOriginLat() == null || visit.getOriginLon() == null
+                || visit.getDestinationLat() == null || visit.getDestinationLon() == null) {
+            return 0.0;
+        }
+        return haversineDistanceKm(visit.getOriginLat(), visit.getOriginLon(), visit.getDestinationLat(), visit.getDestinationLon());
+    }
+
+    private double haversineDistanceKm(double originLat, double originLon, double destinationLat, double destinationLon) {
+        final double earthRadiusKm = 6371.0088;
+        double latDistance = Math.toRadians(destinationLat - originLat);
+        double lonDistance = Math.toRadians(destinationLon - originLon);
+        double originLatRadians = Math.toRadians(originLat);
+        double destinationLatRadians = Math.toRadians(destinationLat);
+
+        double a = Math.sin(latDistance / 2) * Math.sin(latDistance / 2)
+                + Math.cos(originLatRadians) * Math.cos(destinationLatRadians)
+                * Math.sin(lonDistance / 2) * Math.sin(lonDistance / 2);
+        double c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+        return earthRadiusKm * c;
     }
 }

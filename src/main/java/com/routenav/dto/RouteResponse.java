@@ -16,8 +16,8 @@ public class RouteResponse {
     private String originName;
     private String destinationName;
     private Double distanceKm;
+    private Double straightLineDistanceKm;
     private String duration;
     private String geometry;
     private List<String> instructions;
 }
-

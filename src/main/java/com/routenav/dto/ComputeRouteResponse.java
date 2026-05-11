@@ -13,5 +13,6 @@ public class ComputeRouteResponse {
 
     private Object geoJson;
     private Double distanceKm;
+    private Double straightLineDistanceKm;
     private Integer durationSeconds;
 }
