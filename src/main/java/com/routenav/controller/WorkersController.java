@@ -6,7 +6,9 @@ import com.routenav.dto.WorkerResponse;
 import com.routenav.service.WorkerService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.codec.multipart.FilePart;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -15,6 +17,7 @@ import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RequestPart;
 import org.springframework.web.bind.annotation.RestController;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -41,6 +44,16 @@ public class WorkersController {
         return workerService.create(request)
                 .map(response -> ResponseEntity.ok((Object) response))
                 .onErrorResume(IllegalArgumentException.class, e -> Mono.just(ResponseEntity.badRequest()
+                        .body(ErrorResponse.builder().message(e.getMessage()).build())));
+    }
+
+    @PostMapping(value = "/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public Mono<ResponseEntity<Object>> upload(@RequestPart("file") FilePart file) {
+        return workerService.importWorkers(file)
+                .map(workers -> ResponseEntity.ok((Object) workers))
+                .onErrorResume(IllegalArgumentException.class, e -> Mono.just(ResponseEntity.badRequest()
+                        .body(ErrorResponse.builder().message(e.getMessage()).build())))
+                .onErrorResume(e -> Mono.just(ResponseEntity.badRequest()
                         .body(ErrorResponse.builder().message(e.getMessage()).build())));
     }
 

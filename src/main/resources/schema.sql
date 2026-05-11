@@ -100,3 +100,14 @@ CREATE INDEX IF NOT EXISTS idx_worker_mileage_visits_staff_number
 
 CREATE INDEX IF NOT EXISTS idx_worker_mileage_visits_report_id
     ON worker_mileage_visits (report_id, staff_number, visit_date, start_time);
+
+CREATE TABLE IF NOT EXISTS app_users (
+    id              BIGSERIAL PRIMARY KEY,
+    name            VARCHAR(255) NOT NULL,
+    email           VARCHAR(255) NOT NULL UNIQUE,
+    password_hash   VARCHAR(255) NOT NULL,
+    created_at      TIMESTAMP DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_app_users_email
+    ON app_users (email);
