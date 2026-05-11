@@ -11,5 +11,11 @@ public interface RouteRepository extends ReactiveCrudRepository<Route, Long> {
     Flux<Route> findByOriginNameContainingIgnoreCase(String name);
 
     Flux<Route> findAllByOrderByCreatedAtDesc();
-}
 
+    Flux<Route> findAllByOriginLatAndOriginLonAndDestinationLatAndDestinationLonOrderByCreatedAtDesc(
+            Double originLat,
+            Double originLon,
+            Double destinationLat,
+            Double destinationLon
+    );
+}

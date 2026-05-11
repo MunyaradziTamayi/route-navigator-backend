@@ -3,14 +3,16 @@ package com.routenav.service;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.routenav.dto.ComputeRouteResponse;
 import com.routenav.dto.JourneySummaryResponse;
-import com.routenav.dto.OsrmResponse;
+import com.routenav.dto.MapboxDirectionsResponse;
 import com.routenav.dto.RouteRequest;
 import com.routenav.dto.RouteResponse;
 import com.routenav.model.Route;
 import com.routenav.repository.RouteRepository;
 import java.time.LocalDateTime;
+import java.util.Comparator;
 import java.util.List;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
@@ -20,123 +22,118 @@ import reactor.core.publisher.Mono;
 @Service
 public class RoutingService {
 
-    private final WebClient osrmClient;
+    private final WebClient mapboxClient;
+
+    private final String mapboxAccessToken;
 
     private final RouteRepository routeRepository;
 
     private final ObjectMapper objectMapper;
 
-    public RoutingService(@Qualifier("osrmClient") WebClient osrmClient, RouteRepository routeRepository, ObjectMapper objectMapper) {
-        this.osrmClient = osrmClient;
+    public RoutingService(@Qualifier("mapboxClient") WebClient mapboxClient,
+                          @Value("${mapbox.access-token}") String mapboxAccessToken,
+                          RouteRepository routeRepository,
+                          ObjectMapper objectMapper) {
+        this.mapboxClient = mapboxClient;
+        this.mapboxAccessToken = mapboxAccessToken;
         this.routeRepository = routeRepository;
         this.objectMapper = objectMapper;
     }
 
     public Mono<RouteResponse> calculateRoute(RouteRequest request) {
-        String coordinates = request.getOriginLon() + "," + request.getOriginLat()
-                + ";" + request.getDestinationLon() + "," + request.getDestinationLat();
-
-        return osrmClient.get()
-                .uri(uriBuilder -> uriBuilder
-                        .path("/route/v1/driving/" + coordinates)
-                        .queryParam("overview", "full")
-                        .queryParam("geometries", "geojson")
-                        .queryParam("steps", true)
-                        .build())
-                .retrieve()
-                .bodyToMono(OsrmResponse.class)
-                .flatMap(osrm -> {
-                    if (osrm.getRoutes() == null || osrm.getRoutes().isEmpty()) {
-                        return Mono.error(new IllegalStateException("No routes found from OSRM."));
-                    }
-
-                    OsrmResponse.OsrmRoute osrmRoute = osrm.getRoutes().get(0);
-                    if (osrmRoute.getDistance() == null || osrmRoute.getDuration() == null || osrmRoute.getGeometry() == null) {
-                        return Mono.error(new IllegalStateException("OSRM response missing distance/duration/geometry."));
-                    }
-
-                    double distanceMeters = osrmRoute.getDistance();
-                    int durationSecs = osrmRoute.getDuration().intValue();
-                    final String geometry = toGeometryJson(osrmRoute.getGeometry());
-
-                    List<String> instructions = List.of();
-
-                    Route entity = Route.builder()
-                            .originName(request.getOriginName())
-                            .destinationName(request.getDestinationName())
-                            .originLat(request.getOriginLat())
-                            .originLon(request.getOriginLon())
-                            .destinationLat(request.getDestinationLat())
-                            .destinationLon(request.getDestinationLon())
-                            .distanceKm(distanceMeters / 1000.0)
-                            .durationSeconds(durationSecs)
-                            .geometry(geometry)
-                            .createdAt(LocalDateTime.now())
-                            .build();
-
-                    return routeRepository.save(entity)
-                            .map(saved -> RouteResponse.builder()
-                                    .id(saved.getId())
-                                    .originName(request.getOriginName())
-                                    .destinationName(request.getDestinationName())
-                                    .distanceKm(saved.getDistanceKm())
-                                    .duration(formatDuration(durationSecs))
-                                    .geometry(geometry)
-                                    .instructions(instructions)
-                                    .build());
-                });
+        return findCachedRoute(request, true)
+                .map(route -> toRouteResponse(route))
+                .switchIfEmpty(fetchAndSaveRoute(request).map(this::toRouteResponse));
     }
 
     public Mono<ComputeRouteResponse> calculateRouteRaw(RouteRequest request) {
+        return findCachedRoute(request, true)
+                .flatMap(this::toComputeRouteResponse)
+                .switchIfEmpty(fetchAndSaveRoute(request).flatMap(this::toComputeRouteResponse));
+    }
+
+    public Mono<Double> calculateDistanceKm(double originLat, double originLon, double destinationLat, double destinationLon) {
+        RouteRequest request = new RouteRequest();
+        request.setOriginName("Origin");
+        request.setDestinationName("Destination");
+        request.setOriginLat(originLat);
+        request.setOriginLon(originLon);
+        request.setDestinationLat(destinationLat);
+        request.setDestinationLon(destinationLon);
+
+        return findCachedRoute(request, false)
+                .map(Route::getDistanceKm)
+                .switchIfEmpty(fetchAndSaveDistanceOnlyRoute(request).map(Route::getDistanceKm));
+    }
+
+    private Mono<Route> fetchAndSaveRoute(RouteRequest request) {
         String coordinates = request.getOriginLon() + "," + request.getOriginLat()
                 + ";" + request.getDestinationLon() + "," + request.getDestinationLat();
 
-        return osrmClient.get()
+        return mapboxClient.get()
                 .uri(uriBuilder -> uriBuilder
-                        .path("/route/v1/driving/" + coordinates)
+                        .path("/directions/v5/mapbox/driving/" + coordinates)
                         .queryParam("overview", "full")
                         .queryParam("geometries", "geojson")
                         .queryParam("steps", true)
+                        .queryParam("alternatives", true)
+                        .queryParam("access_token", requireMapboxAccessToken())
                         .build())
                 .retrieve()
                 .onStatus(HttpStatusCode::isError, response -> response.bodyToMono(String.class)
                         .defaultIfEmpty("")
                         .flatMap(body -> Mono.error(new IllegalStateException(
-                                "OSRM error (" + response.statusCode().value() + "): " + body))))
-                .bodyToMono(OsrmResponse.class)
-                .flatMap(osrm -> {
-                    if (osrm.getRoutes() == null || osrm.getRoutes().isEmpty()) {
-                        return Mono.error(new IllegalStateException("No routes found from OSRM."));
+                                "Mapbox Directions error (" + response.statusCode().value() + "): " + body))))
+                .bodyToMono(MapboxDirectionsResponse.class)
+                .flatMap(mapbox -> {
+                    if (mapbox.getRoutes() == null || mapbox.getRoutes().isEmpty()) {
+                        return Mono.error(new IllegalStateException(mapboxErrorMessage(mapbox)));
                     }
 
-                    OsrmResponse.OsrmRoute osrmRoute = osrm.getRoutes().get(0);
-                    if (osrmRoute.getDistance() == null || osrmRoute.getDuration() == null || osrmRoute.getGeometry() == null) {
-                        return Mono.error(new IllegalStateException("OSRM response missing distance/duration/geometry."));
+                    MapboxDirectionsResponse.MapboxRoute route = shortestRoute(mapbox);
+                    if (route.getDistance() == null || route.getDuration() == null || route.getGeometry() == null) {
+                        return Mono.error(new IllegalStateException("Mapbox Directions response missing distance/duration/geometry."));
                     }
 
-                    double distanceMeters = osrmRoute.getDistance();
-                    int durationSecs = osrmRoute.getDuration().intValue();
-                    String geometryJson = toGeometryJson(osrmRoute.getGeometry());
+                    double distanceMeters = route.getDistance();
+                    int durationSecs = route.getDuration().intValue();
+                    final String geometry = toGeometryJson(route.getGeometry());
 
-                    Route entity = Route.builder()
-                            .originName(request.getOriginName())
-                            .destinationName(request.getDestinationName())
-                            .originLat(request.getOriginLat())
-                            .originLon(request.getOriginLon())
-                            .destinationLat(request.getDestinationLat())
-                            .destinationLon(request.getDestinationLon())
-                            .distanceKm(distanceMeters / 1000.0)
-                            .durationSeconds(durationSecs)
-                            .geometry(geometryJson)
-                            .createdAt(LocalDateTime.now())
-                            .build();
+                    return routeRepository.save(buildRouteEntity(request, distanceMeters / 1000.0, durationSecs, geometry));
+                });
+    }
 
-                    return routeRepository.save(entity)
-                            .map(saved -> ComputeRouteResponse.builder()
-                                    .geoJson(osrmRoute.getGeometry())
-                                    .distanceKm(saved.getDistanceKm())
-                                    .durationSeconds(durationSecs)
-                                    .build());
+    private Mono<Route> fetchAndSaveDistanceOnlyRoute(RouteRequest request) {
+        String coordinates = request.getOriginLon() + "," + request.getOriginLat()
+                + ";" + request.getDestinationLon() + "," + request.getDestinationLat();
+
+        return mapboxClient.get()
+                .uri(uriBuilder -> uriBuilder
+                        .path("/directions/v5/mapbox/driving/" + coordinates)
+                        .queryParam("overview", "false")
+                        .queryParam("alternatives", true)
+                        .queryParam("access_token", requireMapboxAccessToken())
+                        .build())
+                .retrieve()
+                .onStatus(HttpStatusCode::isError, response -> response.bodyToMono(String.class)
+                        .defaultIfEmpty("")
+                        .flatMap(body -> Mono.error(new IllegalStateException(
+                                "Mapbox Directions error (" + response.statusCode().value() + "): " + body))))
+                .bodyToMono(MapboxDirectionsResponse.class)
+                .flatMap(mapbox -> {
+                    if (mapbox.getRoutes() == null || mapbox.getRoutes().isEmpty()) {
+                        return Mono.error(new IllegalStateException(mapboxErrorMessage(mapbox)));
+                    }
+
+                    MapboxDirectionsResponse.MapboxRoute route = shortestRoute(mapbox);
+                    if (route.getDistance() == null || route.getDuration() == null) {
+                        return Mono.error(new IllegalStateException("Mapbox Directions response missing distance/duration."));
+                    }
+
+                    double distanceMeters = route.getDistance();
+                    int durationSecs = route.getDuration().intValue();
+
+                    return routeRepository.save(buildRouteEntity(request, distanceMeters / 1000.0, durationSecs, null));
                 });
     }
 
@@ -201,6 +198,59 @@ public class RoutingService {
                         .build());
     }
 
+    private Mono<Route> findCachedRoute(RouteRequest request, boolean requireGeometry) {
+        return routeRepository.findAllByOriginLatAndOriginLonAndDestinationLatAndDestinationLonOrderByCreatedAtDesc(
+                        request.getOriginLat(),
+                        request.getOriginLon(),
+                        request.getDestinationLat(),
+                        request.getDestinationLon())
+                .filter(route -> route.getDistanceKm() != null)
+                .filter(route -> !requireGeometry || (route.getGeometry() != null && !route.getGeometry().isBlank()))
+                .next();
+    }
+
+    private Route buildRouteEntity(RouteRequest request, double distanceKm, int durationSeconds, String geometry) {
+        return Route.builder()
+                .originName(request.getOriginName())
+                .destinationName(request.getDestinationName())
+                .originLat(request.getOriginLat())
+                .originLon(request.getOriginLon())
+                .destinationLat(request.getDestinationLat())
+                .destinationLon(request.getDestinationLon())
+                .distanceKm(distanceKm)
+                .durationSeconds(durationSeconds)
+                .geometry(geometry)
+                .createdAt(LocalDateTime.now())
+                .build();
+    }
+
+    private RouteResponse toRouteResponse(Route route) {
+        return RouteResponse.builder()
+                .id(route.getId())
+                .originName(route.getOriginName())
+                .destinationName(route.getDestinationName())
+                .distanceKm(route.getDistanceKm())
+                .duration(formatDuration(route.getDurationSeconds() == null ? 0 : route.getDurationSeconds()))
+                .geometry(route.getGeometry())
+                .instructions(List.of())
+                .build();
+    }
+
+    private Mono<ComputeRouteResponse> toComputeRouteResponse(Route route) {
+        return Mono.fromCallable(() -> {
+            Object geoJson = null;
+            if (route.getGeometry() != null && !route.getGeometry().isBlank()) {
+                geoJson = objectMapper.readTree(route.getGeometry());
+            }
+
+            return ComputeRouteResponse.builder()
+                    .geoJson(geoJson)
+                    .distanceKm(route.getDistanceKm())
+                    .durationSeconds(route.getDurationSeconds())
+                    .build();
+        });
+    }
+
     private String formatDuration(int seconds) {
         int hours = seconds / 3600;
         int minutes = (seconds % 3600) / 60;
@@ -208,11 +258,35 @@ public class RoutingService {
         return minutes + " min";
     }
 
-    private String toGeometryJson(OsrmResponse.OsrmGeometry geometry) {
+    private String toGeometryJson(Object geometry) {
         try {
             return objectMapper.writeValueAsString(geometry);
         } catch (Exception e) {
             return "";
         }
+    }
+
+    private MapboxDirectionsResponse.MapboxRoute shortestRoute(MapboxDirectionsResponse response) {
+        return response.getRoutes().stream()
+                .filter(route -> route.getDistance() != null)
+                .min(Comparator.comparing(MapboxDirectionsResponse.MapboxRoute::getDistance))
+                .orElse(response.getRoutes().get(0));
+    }
+
+    private String mapboxErrorMessage(MapboxDirectionsResponse response) {
+        if (response.getMessage() != null && !response.getMessage().isBlank()) {
+            return "Mapbox Directions error: " + response.getMessage();
+        }
+        if (response.getCode() != null && !response.getCode().isBlank()) {
+            return "Mapbox Directions returned no routes (" + response.getCode() + ").";
+        }
+        return "No routes found from Mapbox Directions.";
+    }
+
+    private String requireMapboxAccessToken() {
+        if (mapboxAccessToken == null || mapboxAccessToken.isBlank()) {
+            throw new IllegalStateException("MAPBOX_ACCESS_TOKEN environment variable is required.");
+        }
+        return mapboxAccessToken;
     }
 }

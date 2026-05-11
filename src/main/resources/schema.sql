@@ -12,6 +12,9 @@ CREATE TABLE IF NOT EXISTS routes (
     created_at       TIMESTAMP DEFAULT NOW()
 );
 
+CREATE INDEX IF NOT EXISTS idx_routes_coordinates
+    ON routes (origin_lat, origin_lon, destination_lat, destination_lon, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS visits (
     id                BIGSERIAL PRIMARY KEY,
     origin_label      VARCHAR(500),

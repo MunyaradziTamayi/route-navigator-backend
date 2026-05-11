@@ -3,9 +3,9 @@ spring:
     name: route-navigator
 
   r2dbc:
-    url: ${SPRING_R2DBC_URL}
-    username: ${SPRING_R2DBC_USERNAME}
-    password: ${SPRING_R2DBC_PASSWORD}
+    url: ${SPRING_R2DBC_URL:r2dbc:postgresql://localhost:5432/route_navigatordb}
+    username: ${SPRING_R2DBC_USERNAME:postgres}
+    password: ${SPRING_R2DBC_PASSWORD:admin}
 
   sql:
     init:
@@ -15,9 +15,6 @@ spring:
 server:
   port: ${PORT:8080}
 
-osrm:
-  base-url: http://router.project-osrm.org
-
-nominatim:
-  base-url: https://nominatim.openstreetmap.org
-
+mapbox:
+  base-url: https://api.mapbox.com
+  access-token: ${MAPBOX_ACCESS_TOKEN:}

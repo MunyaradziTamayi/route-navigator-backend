@@ -11,6 +11,8 @@ public class CorsConfig implements WebFluxConfigurer {
     public void addCorsMappings(CorsRegistry registry) {
         registry.addMapping("/api/**")
                 .allowedOrigins(
+                    "http://localhost:8080",
+                    "http://127.0.0.1:8080",
                     "http://localhost:4200",
                     "http://127.0.0.1:4200",
                     "https://careroute-eta.vercel.app",
