@@ -13,6 +13,7 @@ import lombok.NoArgsConstructor;
 public class WorkerResponse {
 
     private Long id;
+    private String staffNumber;
     private String name;
     private String email;
     private String phone;

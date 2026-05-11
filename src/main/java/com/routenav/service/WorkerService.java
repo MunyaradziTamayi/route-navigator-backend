@@ -25,14 +25,24 @@ public class WorkerService {
     }
 
     public Mono<WorkerResponse> create(WorkerRequest request) {
+        if (request.getStaffNumber() == null || request.getStaffNumber().isBlank()) {
+            return Mono.error(new IllegalArgumentException("Staff number is required."));
+        }
+
         LocalDateTime now = LocalDateTime.now();
         Worker worker = toEntity(request, null, now, now);
-        return workerRepository.save(worker).map(this::toResponse);
+        return ensureStaffNumberAvailable(request.getStaffNumber(), null)
+                .then(workerRepository.save(worker))
+                .map(this::toResponse);
     }
 
     public Mono<WorkerResponse> update(Long id, WorkerRequest request) {
+        if (request.getStaffNumber() == null || request.getStaffNumber().isBlank()) {
+            return Mono.error(new IllegalArgumentException("Staff number is required."));
+        }
+
         return workerRepository.findById(id)
-                .flatMap(existing -> {
+                .flatMap(existing -> ensureStaffNumberAvailable(request.getStaffNumber(), id).then(Mono.defer(() -> {
                     Worker worker = toEntity(
                             request,
                             id,
@@ -40,7 +50,7 @@ public class WorkerService {
                             LocalDateTime.now()
                     );
                     return workerRepository.save(worker);
-                })
+                })))
                 .map(this::toResponse);
     }
 
@@ -55,6 +65,7 @@ public class WorkerService {
     private Worker toEntity(WorkerRequest request, Long id, LocalDateTime createdAt, LocalDateTime updatedAt) {
         return Worker.builder()
                 .id(id)
+                .staffNumber(request.getStaffNumber().trim())
                 .name(request.getName())
                 .email(request.getEmail())
                 .phone(request.getPhone())
@@ -68,6 +79,7 @@ public class WorkerService {
     private WorkerResponse toResponse(Worker worker) {
         return WorkerResponse.builder()
                 .id(worker.getId())
+                .staffNumber(worker.getStaffNumber())
                 .name(worker.getName())
                 .email(worker.getEmail())
                 .phone(worker.getPhone())
@@ -76,5 +88,12 @@ public class WorkerService {
                 .createdAt(worker.getCreatedAt())
                 .updatedAt(worker.getUpdatedAt())
                 .build();
+    }
+
+    private Mono<Void> ensureStaffNumberAvailable(String staffNumber, Long currentWorkerId) {
+        return workerRepository.findByStaffNumber(staffNumber.trim())
+                .filter(worker -> currentWorkerId == null || !currentWorkerId.equals(worker.getId()))
+                .flatMap(worker -> Mono.error(new IllegalArgumentException("Staff number already exists: " + staffNumber)))
+                .then();
     }
 }

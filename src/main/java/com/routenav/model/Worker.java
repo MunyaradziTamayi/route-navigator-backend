@@ -17,6 +17,7 @@ public class Worker {
 
     @Id
     private Long id;
+    private String staffNumber;
     private String name;
     private String email;
     private String phone;

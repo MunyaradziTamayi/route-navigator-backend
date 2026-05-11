@@ -1,5 +1,6 @@
 package com.routenav.controller;
 
+import com.routenav.dto.ErrorResponse;
 import com.routenav.dto.WorkerRequest;
 import com.routenav.dto.WorkerResponse;
 import com.routenav.service.WorkerService;
@@ -36,18 +37,23 @@ public class WorkersController {
     }
 
     @PostMapping
-    public Mono<ResponseEntity<WorkerResponse>> create(@Valid @RequestBody WorkerRequest request) {
-        return workerService.create(request).map(ResponseEntity::ok);
+    public Mono<ResponseEntity<Object>> create(@Valid @RequestBody WorkerRequest request) {
+        return workerService.create(request)
+                .map(response -> ResponseEntity.ok((Object) response))
+                .onErrorResume(IllegalArgumentException.class, e -> Mono.just(ResponseEntity.badRequest()
+                        .body(ErrorResponse.builder().message(e.getMessage()).build())));
     }
 
     @PutMapping("/{id}")
-    public Mono<ResponseEntity<WorkerResponse>> update(
+    public Mono<ResponseEntity<Object>> update(
             @PathVariable Long id,
             @Valid @RequestBody WorkerRequest request
     ) {
         return workerService.update(id, request)
-                .map(ResponseEntity::ok)
-                .defaultIfEmpty(ResponseEntity.notFound().build());
+                .map(response -> ResponseEntity.ok((Object) response))
+                .defaultIfEmpty(ResponseEntity.notFound().build())
+                .onErrorResume(IllegalArgumentException.class, e -> Mono.just(ResponseEntity.badRequest()
+                        .body(ErrorResponse.builder().message(e.getMessage()).build())));
     }
 
     @DeleteMapping("/{id}")

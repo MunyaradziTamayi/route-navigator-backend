@@ -46,6 +46,7 @@ ALTER TABLE visits ADD COLUMN IF NOT EXISTS status VARCHAR(255) DEFAULT 'pending
 
 CREATE TABLE IF NOT EXISTS workers (
     id               BIGSERIAL PRIMARY KEY,
+    staff_number     VARCHAR(100),
     name             VARCHAR(255) NOT NULL,
     email            VARCHAR(255) NOT NULL,
     phone            VARCHAR(20),
@@ -54,3 +55,29 @@ CREATE TABLE IF NOT EXISTS workers (
     created_at       TIMESTAMP DEFAULT NOW(),
     updated_at       TIMESTAMP DEFAULT NOW()
 );
+
+ALTER TABLE workers ADD COLUMN IF NOT EXISTS staff_number VARCHAR(100);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workers_staff_number
+    ON workers (staff_number);
+
+CREATE TABLE IF NOT EXISTS worker_mileage_reports (
+    id             BIGSERIAL PRIMARY KEY,
+    report_month   VARCHAR(7) NOT NULL,
+    file_name      VARCHAR(255) NOT NULL,
+    file_content   BYTEA NOT NULL,
+    created_at     TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS worker_mileage_report_rows (
+    id              BIGSERIAL PRIMARY KEY,
+    report_id       BIGINT NOT NULL REFERENCES worker_mileage_reports(id) ON DELETE CASCADE,
+    staff_number    VARCHAR(100) NOT NULL,
+    total_mileage   DOUBLE PRECISION NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_worker_mileage_reports_month
+    ON worker_mileage_reports (report_month, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_worker_mileage_report_rows_report_id
+    ON worker_mileage_report_rows (report_id, staff_number);
