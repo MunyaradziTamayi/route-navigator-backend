@@ -15,6 +15,7 @@ import java.io.IOException;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.time.Month;
 import java.time.YearMonth;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
@@ -25,6 +26,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
+import java.util.TreeMap;
 import org.apache.poi.ss.usermodel.Cell;
 import org.apache.poi.ss.usermodel.CellType;
 import org.apache.poi.ss.usermodel.DataFormatter;
@@ -81,22 +84,37 @@ public class MileageUploadService {
         this.visitRepository = visitRepository;
     }
 
-    public Mono<WorkerMileageReportResponse> calculateMonthlyMileageReport(FilePart file) {
+    public Mono<List<WorkerMileageReportResponse>> calculateMonthlyMileageReports(FilePart file) {
         return DataBufferUtils.join(file.content())
                 .map(this::toBytes)
                 .flatMap(bytes -> Mono.fromCallable(() -> parseVisits(bytes))
                         .subscribeOn(Schedulers.boundedElastic()))
-                .flatMap(visits -> geocodeVisits(visits)
+                .flatMapMany(visits -> Flux.fromIterable(groupVisitsByMonth(visits).entrySet()))
+                .concatMap(entry -> geocodeVisits(entry.getValue())
                         .flatMap(this::calculateMileage)
                         .flatMap(results -> Mono.fromCallable(() -> buildWorkbook(results))
                                 .subscribeOn(Schedulers.boundedElastic())
-                                .flatMap(workbook -> saveReport(reportMonth(visits), visits, results, workbook))));
+                                .flatMap(workbook -> saveReport(reportMonth(entry.getKey()), entry.getValue(), results, workbook))))
+                .collectList();
     }
 
-    public Flux<WorkerMileageReportResponse> listReports(String reportMonth) {
-        Flux<WorkerMileageReport> reports = reportMonth == null || reportMonth.isBlank()
-                ? reportRepository.findAllByOrderByCreatedAtDesc()
-                : reportRepository.findByReportMonthOrderByCreatedAtDesc(reportMonth.trim());
+    public Flux<WorkerMileageReportResponse> listReports(String reportMonth, Integer year) {
+        ReportMonthFilter filter = parseReportMonthFilter(reportMonth, year);
+        Flux<WorkerMileageReport> reports;
+        if (filter == null) {
+            reports = reportRepository.findAllByOrderByCreatedAtDesc();
+        } else if (filter.exactReportMonth() != null) {
+            reports = reportRepository.findByReportMonthOrderByCreatedAtDesc(filter.exactReportMonth());
+        } else if (filter.year() != null) {
+            reports = reportRepository.findByReportMonthStartingWithOrderByCreatedAtDesc(filter.year() + "-");
+        } else {
+            reports = reportRepository.findAllByOrderByCreatedAtDesc();
+        }
+
+        if (filter != null && filter.month() != null && filter.exactReportMonth() == null) {
+            reports = reports.filter(report -> reportMonthMatches(report.getReportMonth(), filter.month()));
+        }
+
         return reports.flatMap(this::toReportResponse);
     }
 
@@ -270,12 +288,87 @@ public class MileageUploadService {
                 .collectList();
     }
 
-    private String reportMonth(List<VisitRow> visits) {
-        YearMonth yearMonth = visits.stream()
-                .map(visit -> YearMonth.from(visit.visitDateTime()))
-                .min(YearMonth::compareTo)
-                .orElse(YearMonth.now());
+    private Map<YearMonth, List<VisitRow>> groupVisitsByMonth(List<VisitRow> visits) {
+        Map<YearMonth, List<VisitRow>> visitsByMonth = new TreeMap<>();
+        for (VisitRow visit : visits) {
+            visitsByMonth.computeIfAbsent(YearMonth.from(visit.visitDateTime()), ignored -> new ArrayList<>()).add(visit);
+        }
+        return visitsByMonth;
+    }
+
+    private String reportMonth(YearMonth yearMonth) {
         return yearMonth.toString();
+    }
+
+    private ReportMonthFilter parseReportMonthFilter(String reportMonth, Integer year) {
+        String monthText = reportMonth == null ? "" : reportMonth.trim();
+        if (monthText.isBlank() && year == null) {
+            return null;
+        }
+
+        if (monthText.matches("\\d{4}-\\d{2}")) {
+            YearMonth parsed = YearMonth.parse(monthText);
+            return new ReportMonthFilter(parsed.toString(), parsed.getYear(), parsed.getMonthValue());
+        }
+
+        if (year != null) {
+            Integer month = monthText.isBlank() ? null : parseMonthValue(monthText)
+                    .orElseThrow(() -> new IllegalArgumentException("Invalid month value: " + reportMonth));
+            String exact = month == null ? null : YearMonth.of(year, month).toString();
+            return new ReportMonthFilter(exact, year, month);
+        }
+
+        ParsedMonthYear parsed = parseMonthYear(monthText)
+                .orElseThrow(() -> new IllegalArgumentException("Use a month and year, for example: May 2026."));
+        return new ReportMonthFilter(YearMonth.of(parsed.year(), parsed.month()).toString(), parsed.year(), parsed.month());
+    }
+
+    private Optional<ParsedMonthYear> parseMonthYear(String value) {
+        String normalized = value.trim().replace(",", " ").replace("-", " ").replace("/", " ");
+        String[] parts = normalized.split("\\s+");
+        if (parts.length != 2) {
+            return Optional.empty();
+        }
+
+        Integer parsedYear = null;
+        Integer parsedMonth = null;
+        for (String part : parts) {
+            if (part.matches("\\d{4}")) {
+                parsedYear = Integer.valueOf(part);
+            } else {
+                parsedMonth = parseMonthValue(part).orElse(null);
+            }
+        }
+
+        if (parsedYear == null || parsedMonth == null) {
+            return Optional.empty();
+        }
+        return Optional.of(new ParsedMonthYear(parsedMonth, parsedYear));
+    }
+
+    private Optional<Integer> parseMonthValue(String value) {
+        String normalized = value.trim().toLowerCase(Locale.ENGLISH);
+        if (normalized.matches("\\d{1,2}")) {
+            int month = Integer.parseInt(normalized);
+            return month >= 1 && month <= 12 ? Optional.of(month) : Optional.empty();
+        }
+
+        for (Month month : Month.values()) {
+            String fullName = month.getDisplayName(java.time.format.TextStyle.FULL, Locale.ENGLISH).toLowerCase(Locale.ENGLISH);
+            String shortName = month.getDisplayName(java.time.format.TextStyle.SHORT, Locale.ENGLISH).toLowerCase(Locale.ENGLISH);
+            if (normalized.equals(fullName) || normalized.equals(shortName)) {
+                return Optional.of(month.getValue());
+            }
+        }
+        return Optional.empty();
+    }
+
+    private boolean reportMonthMatches(String reportMonth, int month) {
+        try {
+            return YearMonth.parse(reportMonth).getMonthValue() == month;
+        } catch (DateTimeParseException e) {
+            return false;
+        }
     }
 
     private Mono<MileageResult> calculateStaffMileage(String staffNumber, List<VisitRow> visits) {
@@ -441,5 +534,11 @@ public class MileageUploadService {
     }
 
     private record TimeRange(LocalTime startTime, LocalTime endTime) {
+    }
+
+    private record ReportMonthFilter(String exactReportMonth, Integer year, Integer month) {
+    }
+
+    private record ParsedMonthYear(int month, int year) {
     }
 }
