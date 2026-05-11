@@ -93,10 +93,10 @@ public class MileageUploadService {
                 .map(visits -> filterVisitsByReportMonth(visits, filter))
                 .flatMapMany(visits -> Flux.fromIterable(groupVisitsByMonth(visits).entrySet()))
                 .concatMap(entry -> geocodeVisits(entry.getValue())
-                        .flatMap(this::calculateMileage)
-                        .flatMap(results -> Mono.fromCallable(() -> buildWorkbook(results))
-                                .subscribeOn(Schedulers.boundedElastic())
-                                .flatMap(workbook -> saveReport(reportMonth(entry.getKey()), entry.getValue(), results, workbook))))
+                        .flatMap(geocodedVisits -> calculateMileage(geocodedVisits)
+                                .flatMap(results -> Mono.fromCallable(() -> buildWorkbook(results))
+                                        .subscribeOn(Schedulers.boundedElastic())
+                                        .flatMap(workbook -> saveReport(reportMonth(entry.getKey()), geocodedVisits, results, workbook)))))
                 .collectList();
     }
 
