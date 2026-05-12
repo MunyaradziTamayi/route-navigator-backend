@@ -202,7 +202,13 @@ public class MileageUploadService {
     }
 
     public Mono<WorkerMileageReport> getReportFile(Long reportId) {
-        return reportRepository.findById(reportId);
+        return reportRepository.findById(reportId)
+                .flatMap(report -> reportRowRepository.findByReportIdOrderByStaffNumberAsc(reportId)
+                        .collectList()
+                        .flatMap(rows -> Mono.fromCallable(() -> {
+                            report.setFileContent(buildWorkbookFromRows(rows));
+                            return report;
+                        }).subscribeOn(Schedulers.boundedElastic())));
     }
 
     public Flux<WorkerMileageVisitResponse> getVisitsByStaffNumber(String staffNumber) {
@@ -693,20 +699,38 @@ public class MileageUploadService {
             Sheet sheet = workbook.createSheet("Mileage Results");
             Row header = sheet.createRow(0);
             header.createCell(0).setCellValue("Staff Number");
-            header.createCell(1).setCellValue("Total Driving Mileage");
-            header.createCell(2).setCellValue("Total Straight-Line Mileage");
+            header.createCell(1).setCellValue("Driving Mileage");
 
             for (int i = 0; i < results.size(); i++) {
                 MileageResult result = results.get(i);
                 Row row = sheet.createRow(i + 1);
                 row.createCell(0).setCellValue(result.staffNumber());
-                row.createCell(1).setCellValue(roundMileage(result.totalMileageKm()));
-                row.createCell(2).setCellValue(roundMileage(result.totalStraightLineMileageKm()));
+                row.createCell(1).setCellValue(kmToMiles(result.totalMileageKm()));
             }
 
             sheet.autoSizeColumn(0);
             sheet.autoSizeColumn(1);
-            sheet.autoSizeColumn(2);
+            workbook.write(outputStream);
+            return outputStream.toByteArray();
+        }
+    }
+
+    private byte[] buildWorkbookFromRows(List<WorkerMileageReportRow> rows) throws IOException {
+        try (Workbook workbook = new XSSFWorkbook(); ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
+            Sheet sheet = workbook.createSheet("Mileage Results");
+            Row header = sheet.createRow(0);
+            header.createCell(0).setCellValue("Staff Number");
+            header.createCell(1).setCellValue("Driving Mileage");
+
+            for (int i = 0; i < rows.size(); i++) {
+                WorkerMileageReportRow result = rows.get(i);
+                Row row = sheet.createRow(i + 1);
+                row.createCell(0).setCellValue(result.getStaffNumber());
+                row.createCell(1).setCellValue(kmToMiles(result.getTotalMileage() == null ? 0.0 : result.getTotalMileage()));
+            }
+
+            sheet.autoSizeColumn(0);
+            sheet.autoSizeColumn(1);
             workbook.write(outputStream);
             return outputStream.toByteArray();
         }
@@ -721,18 +745,28 @@ public class MileageUploadService {
     }
 
     private Mono<WorkerMileageReportResponse> saveReport(Long uploadId, String reportMonth, List<VisitRow> visits, List<MileageResult> results, byte[] workbook) {
+        LocalDateTime createdAt = LocalDateTime.now();
         WorkerMileageReport report = WorkerMileageReport.builder()
                 .uploadId(uploadId)
                 .reportMonth(reportMonth)
-                .fileName("worker-mileage-" + reportMonth + ".xlsx")
+                .fileName(reportFileName(reportMonth, createdAt))
                 .fileContent(workbook)
-                .createdAt(LocalDateTime.now())
+                .createdAt(createdAt)
                 .build();
 
         return reportRepository.save(report)
                 .flatMap(saved -> saveReportRows(saved.getId(), results)
                         .then(saveReportVisits(saved.getId(), visits))
                         .then(toReportResponse(saved)));
+    }
+
+    private String reportFileName(String reportMonth, LocalDateTime createdAt) {
+        String month = monthLabel(reportMonth)
+                .toLowerCase(Locale.ROOT)
+                .replaceAll("[^a-z0-9]+", "-")
+                .replaceAll("(^-|-$)", "");
+        String generatedDate = createdAt.toLocalDate().format(DateTimeFormatter.ISO_LOCAL_DATE);
+        return "worker-mileage-" + month + "-generated-" + generatedDate + ".xlsx";
     }
 
     private Mono<Void> saveReportRows(Long reportId, List<MileageResult> results) {
