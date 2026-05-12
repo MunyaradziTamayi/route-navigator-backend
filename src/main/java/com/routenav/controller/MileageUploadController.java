@@ -3,9 +3,11 @@ package com.routenav.controller;
 import com.routenav.dto.ErrorResponse;
 import com.routenav.dto.WorkerMileageReportResponse;
 import com.routenav.dto.WorkerMileageTotalResponse;
+import com.routenav.dto.WorkerMileageUploadResponse;
 import com.routenav.dto.WorkerMileageVisitResponse;
 import com.routenav.model.WorkerMileageReport;
 import com.routenav.service.MileageUploadService;
+import java.time.LocalDate;
 import lombok.RequiredArgsConstructor;
 import org.springframework.core.io.ByteArrayResource;
 import org.springframework.http.ContentDisposition;
@@ -21,6 +23,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestPart;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.format.annotation.DateTimeFormat;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
@@ -36,12 +39,26 @@ public class MileageUploadController {
 
     @PostMapping(value = "/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public Mono<ResponseEntity<Object>> upload(@RequestPart("file") FilePart file) {
-        return mileageUploadService.calculateMonthlyMileageTotals(file)
-                .map(totals -> ResponseEntity.ok((Object) totals))
+        return mileageUploadService.calculateMonthlyMileageUpload(file)
+                .map(upload -> ResponseEntity.ok((Object) upload))
                 .onErrorResume(IllegalArgumentException.class, e -> Mono.just(ResponseEntity.badRequest()
                         .body(ErrorResponse.builder().message(e.getMessage()).build())))
                 .onErrorResume(e -> Mono.just(ResponseEntity.status(HttpStatus.BAD_GATEWAY)
                         .body(ErrorResponse.builder().message(e.getMessage()).build())));
+    }
+
+    @GetMapping("/uploads")
+    public Flux<WorkerMileageUploadResponse> listUploads(
+            @RequestParam(name = "date", required = false)
+            @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date) {
+        return mileageUploadService.listUploads(date);
+    }
+
+    @GetMapping("/uploads/{id}")
+    public Mono<ResponseEntity<WorkerMileageUploadResponse>> getUpload(@PathVariable("id") Long id) {
+        return mileageUploadService.getUpload(id)
+                .map(ResponseEntity::ok)
+                .defaultIfEmpty(ResponseEntity.notFound().build());
     }
 
     @GetMapping("/reports")

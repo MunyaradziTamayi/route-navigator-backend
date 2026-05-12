@@ -4,12 +4,15 @@ import com.routenav.dto.WorkerMileageReportResponse;
 import com.routenav.dto.WorkerMileageReportRowResponse;
 import com.routenav.dto.WorkerMileageTotalResponse;
 import com.routenav.dto.WorkerMileageTotalRowResponse;
+import com.routenav.dto.WorkerMileageUploadResponse;
 import com.routenav.dto.WorkerMileageVisitResponse;
 import com.routenav.model.WorkerMileageReport;
 import com.routenav.model.WorkerMileageReportRow;
+import com.routenav.model.WorkerMileageUpload;
 import com.routenav.model.WorkerMileageVisit;
 import com.routenav.repository.WorkerMileageReportRepository;
 import com.routenav.repository.WorkerMileageReportRowRepository;
+import com.routenav.repository.WorkerMileageUploadRepository;
 import com.routenav.repository.WorkerMileageVisitRepository;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -74,21 +77,29 @@ public class MileageUploadService {
 
     private final WorkerMileageReportRowRepository reportRowRepository;
 
+    private final WorkerMileageUploadRepository uploadRepository;
+
     private final WorkerMileageVisitRepository visitRepository;
 
     public MileageUploadService(GeocodingService geocodingService,
                                 RoutingService routingService,
                                 WorkerMileageReportRepository reportRepository,
                                 WorkerMileageReportRowRepository reportRowRepository,
+                                WorkerMileageUploadRepository uploadRepository,
                                 WorkerMileageVisitRepository visitRepository) {
         this.geocodingService = geocodingService;
         this.routingService = routingService;
         this.reportRepository = reportRepository;
         this.reportRowRepository = reportRowRepository;
+        this.uploadRepository = uploadRepository;
         this.visitRepository = visitRepository;
     }
 
     public Mono<List<WorkerMileageReportResponse>> calculateMonthlyMileageReports(FilePart file) {
+        return calculateMonthlyMileageReports(file, null);
+    }
+
+    private Mono<List<WorkerMileageReportResponse>> calculateMonthlyMileageReports(FilePart file, Long uploadId) {
         return DataBufferUtils.join(file.content())
                 .map(this::toBytes)
                 .flatMap(bytes -> Mono.fromCallable(() -> parseVisits(bytes))
@@ -98,13 +109,19 @@ public class MileageUploadService {
                         .flatMap(geocodedVisits -> calculateMileage(geocodedVisits)
                                 .flatMap(results -> Mono.fromCallable(() -> buildWorkbook(results))
                                         .subscribeOn(Schedulers.boundedElastic())
-                                        .flatMap(workbook -> saveReport(reportMonth(entry.getKey()), geocodedVisits, results, workbook)))))
+                                        .flatMap(workbook -> saveReport(uploadId, reportMonth(entry.getKey()), geocodedVisits, results, workbook)))))
                 .collectList();
     }
 
     public Mono<List<WorkerMileageTotalResponse>> calculateMonthlyMileageTotals(FilePart file) {
-        return calculateMonthlyMileageReports(file)
-                .map(this::toUploadedMileageTotalResponses);
+        return calculateMonthlyMileageUpload(file)
+                .map(WorkerMileageUploadResponse::getTotals);
+    }
+
+    public Mono<WorkerMileageUploadResponse> calculateMonthlyMileageUpload(FilePart file) {
+        return saveUpload(file.filename())
+                .flatMap(upload -> calculateMonthlyMileageReports(file, upload.getId())
+                        .map(reports -> toUploadResponse(upload, reports, true)));
     }
 
     public Flux<WorkerMileageReportResponse> listReports(String reportMonth, Integer year) {
@@ -134,6 +151,30 @@ public class MileageUploadService {
                     }
                     return Flux.fromIterable(totals);
                 });
+    }
+
+    public Flux<WorkerMileageUploadResponse> listUploads(LocalDate uploadDate) {
+        Flux<WorkerMileageUpload> uploads = uploadDate == null
+                ? uploadRepository.findAllByOrderByCreatedAtDesc()
+                : uploadRepository.findByCreatedAtBetweenOrderByCreatedAtDesc(uploadDate.atStartOfDay(), uploadDate.plusDays(1).atStartOfDay());
+
+        return uploads.flatMap(upload -> getUpload(upload.getId())
+                .defaultIfEmpty(toUploadResponse(upload, List.of(), false)));
+    }
+
+    public Mono<WorkerMileageUploadResponse> getUpload(Long uploadId) {
+        return uploadRepository.findById(uploadId)
+                .flatMap(upload -> reportRepository.findByUploadIdOrderByReportMonthAsc(uploadId)
+                        .flatMap(this::toReportResponse)
+                        .collectList()
+                        .map(reports -> toUploadResponse(upload, reports, true)));
+    }
+
+    private Mono<WorkerMileageUpload> saveUpload(String fileName) {
+        return uploadRepository.save(WorkerMileageUpload.builder()
+                .fileName(fileName == null || fileName.isBlank() ? "worker-mileage-upload.xlsx" : fileName)
+                .createdAt(LocalDateTime.now())
+                .build());
     }
 
     private Flux<WorkerMileageReport> findReports(String reportMonth, Integer year) {
@@ -563,6 +604,7 @@ public class MileageUploadService {
 
         return WorkerMileageTotalResponse.builder()
                 .reportMonth(reportMonth)
+                .uploadId(uploadIdFromReportResponses(reports))
                 .label(label)
                 .totalMileageMiles(kmToMiles(totalMileageKm))
                 .reportCount(reports.size())
@@ -575,6 +617,34 @@ public class MileageUploadService {
             return row.getTotalMileageKm();
         }
         return row.getTotalMileage() == null ? 0.0 : row.getTotalMileage();
+    }
+
+    private Long uploadIdFromReportResponses(List<WorkerMileageReportResponse> reports) {
+        return reports.stream()
+                .map(WorkerMileageReportResponse::getUploadId)
+                .filter(id -> id != null)
+                .findFirst()
+                .orElse(null);
+    }
+
+    private WorkerMileageUploadResponse toUploadResponse(WorkerMileageUpload upload,
+                                                        List<WorkerMileageReportResponse> reports,
+                                                        boolean includeReports) {
+        List<String> reportMonths = reports.stream()
+                .map(WorkerMileageReportResponse::getReportMonth)
+                .distinct()
+                .sorted()
+                .toList();
+
+        return WorkerMileageUploadResponse.builder()
+                .id(upload.getId())
+                .fileName(upload.getFileName())
+                .createdAt(upload.getCreatedAt())
+                .reportCount(reports.size())
+                .reportMonths(reportMonths)
+                .totals(toUploadedMileageTotalResponses(reports))
+                .reports(includeReports ? reports : List.of())
+                .build();
     }
 
     private WorkerMileageTotalResponse toStoredMileageTotalResponse(String reportMonth, String label, List<ReportRows> reports) {
@@ -600,6 +670,7 @@ public class MileageUploadService {
 
         return WorkerMileageTotalResponse.builder()
                 .reportMonth(reportMonth)
+                .uploadId(uploadIdFromReportRows(reports))
                 .label(label)
                 .totalMileageMiles(kmToMiles(totalMileage))
                 .reportCount(reports.size())
@@ -641,8 +712,17 @@ public class MileageUploadService {
         }
     }
 
-    private Mono<WorkerMileageReportResponse> saveReport(String reportMonth, List<VisitRow> visits, List<MileageResult> results, byte[] workbook) {
+    private Long uploadIdFromReportRows(List<ReportRows> reports) {
+        return reports.stream()
+                .map(reportRows -> reportRows.report().getUploadId())
+                .filter(id -> id != null)
+                .findFirst()
+                .orElse(null);
+    }
+
+    private Mono<WorkerMileageReportResponse> saveReport(Long uploadId, String reportMonth, List<VisitRow> visits, List<MileageResult> results, byte[] workbook) {
         WorkerMileageReport report = WorkerMileageReport.builder()
+                .uploadId(uploadId)
                 .reportMonth(reportMonth)
                 .fileName("worker-mileage-" + reportMonth + ".xlsx")
                 .fileContent(workbook)
@@ -708,6 +788,7 @@ public class MileageUploadService {
                             .collectList()
                             .map(visitResponses -> WorkerMileageReportResponse.builder()
                                     .id(report.getId())
+                                    .uploadId(report.getUploadId())
                                     .reportMonth(report.getReportMonth())
                                     .fileName(report.getFileName())
                                     .downloadUrl("/api/mileage/reports/" + report.getId() + "/download")

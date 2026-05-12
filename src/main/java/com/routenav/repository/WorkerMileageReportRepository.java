@@ -13,4 +13,6 @@ public interface WorkerMileageReportRepository extends ReactiveCrudRepository<Wo
     Flux<WorkerMileageReport> findByReportMonthOrderByCreatedAtDesc(String reportMonth);
 
     Flux<WorkerMileageReport> findByReportMonthStartingWithOrderByCreatedAtDesc(String reportMonthPrefix);
+
+    Flux<WorkerMileageReport> findByUploadIdOrderByReportMonthAsc(Long uploadId);
 }

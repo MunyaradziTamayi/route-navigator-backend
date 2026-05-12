@@ -14,6 +14,7 @@ import lombok.NoArgsConstructor;
 public class WorkerMileageReportResponse {
 
     private Long id;
+    private Long uploadId;
     private String reportMonth;
     private String fileName;
     private String downloadUrl;

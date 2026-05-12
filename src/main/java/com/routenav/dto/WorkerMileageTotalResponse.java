@@ -13,6 +13,7 @@ import lombok.NoArgsConstructor;
 public class WorkerMileageTotalResponse {
 
     private String reportMonth;
+    private Long uploadId;
     private String label;
     private Double totalMileageMiles;
     private Integer reportCount;

@@ -17,6 +17,7 @@ public class WorkerMileageReport {
 
     @Id
     private Long id;
+    private Long uploadId;
     private String reportMonth;
     private String fileName;
     private byte[] fileContent;

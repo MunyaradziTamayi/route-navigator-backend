@@ -61,13 +61,22 @@ ALTER TABLE workers ADD COLUMN IF NOT EXISTS staff_number VARCHAR(100);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_workers_staff_number
     ON workers (staff_number);
 
+CREATE TABLE IF NOT EXISTS worker_mileage_uploads (
+    id             BIGSERIAL PRIMARY KEY,
+    file_name      VARCHAR(255) NOT NULL,
+    created_at     TIMESTAMP DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS worker_mileage_reports (
     id             BIGSERIAL PRIMARY KEY,
+    upload_id      BIGINT REFERENCES worker_mileage_uploads(id) ON DELETE SET NULL,
     report_month   VARCHAR(7) NOT NULL,
     file_name      VARCHAR(255) NOT NULL,
     file_content   BYTEA NOT NULL,
     created_at     TIMESTAMP DEFAULT NOW()
 );
+
+ALTER TABLE worker_mileage_reports ADD COLUMN IF NOT EXISTS upload_id BIGINT REFERENCES worker_mileage_uploads(id) ON DELETE SET NULL;
 
 CREATE TABLE IF NOT EXISTS worker_mileage_report_rows (
     id              BIGSERIAL PRIMARY KEY,
@@ -91,6 +100,12 @@ CREATE TABLE IF NOT EXISTS worker_mileage_visits (
 
 CREATE INDEX IF NOT EXISTS idx_worker_mileage_reports_month
     ON worker_mileage_reports (report_month, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_worker_mileage_uploads_created_at
+    ON worker_mileage_uploads (created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_worker_mileage_reports_upload_id
+    ON worker_mileage_reports (upload_id, report_month);
 
 CREATE INDEX IF NOT EXISTS idx_worker_mileage_report_rows_report_id
     ON worker_mileage_report_rows (report_id, staff_number);
