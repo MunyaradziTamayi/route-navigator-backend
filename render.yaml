@@ -29,6 +29,8 @@ services:
         fromDatabase:
           name: routenav-db
           property: password
+      - key: GOOGLE_API_KEY
+        sync: false
 
 databases:
   - name: routenav-db

@@ -20,13 +20,12 @@ public class JourneysController {
     private final RoutingService routingService;
 
     @GetMapping
-    public Flux<JourneySummaryResponse> list(@RequestParam(defaultValue = "20") int limit) {
+    public Flux<JourneySummaryResponse> list(@RequestParam(name = "limit", defaultValue = "20") int limit) {
         return routingService.getJourneys(limit);
     }
 
     @GetMapping("/{id}")
-    public Mono<ComputeRouteResponse> get(@PathVariable String id) {
+    public Mono<ComputeRouteResponse> get(@PathVariable("id") String id) {
         return routingService.getJourneyRoute(id);
     }
 }
-

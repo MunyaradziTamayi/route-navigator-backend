@@ -15,6 +15,7 @@ spring:
 server:
   port: ${PORT:8080}
 
-mapbox:
-  base-url: https://api.mapbox.com
-  access-token: ${MAPBOX_ACCESS_TOKEN:}
+google:
+  api-key: ${GOOGLE_API_KEY:}
+  routes-base-url: https://routes.googleapis.com
+  geocoding-base-url: https://maps.googleapis.com

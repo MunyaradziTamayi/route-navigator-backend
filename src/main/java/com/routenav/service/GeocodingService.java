@@ -1,9 +1,10 @@
 package com.routenav.service;
 
 import com.routenav.dto.GeocodeResponse;
-import com.routenav.dto.MapboxGeocodingResponse;
+import com.routenav.dto.GoogleGeocodingResponse;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatusCode;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 import org.springframework.web.reactive.function.client.WebClient;
@@ -13,37 +14,46 @@ import reactor.core.publisher.Mono;
 @Service
 public class GeocodingService {
 
-    private final WebClient mapboxClient;
+    private final WebClient googleGeocodingClient;
 
-    private final String mapboxAccessToken;
+    private final String googleApiKey;
 
-    public GeocodingService(@Qualifier("mapboxClient") WebClient mapboxClient,
-                            @Value("${mapbox.access-token}") String mapboxAccessToken) {
-        this.mapboxClient = mapboxClient;
-        this.mapboxAccessToken = mapboxAccessToken;
+    public GeocodingService(@Qualifier("googleGeocodingClient") WebClient googleGeocodingClient,
+                            @Value("${google.api-key}") String googleApiKey) {
+        this.googleGeocodingClient = googleGeocodingClient;
+        this.googleApiKey = googleApiKey;
     }
 
     public Flux<GeocodeResponse> search(String query) {
-        return mapboxClient.get()
+        return googleGeocodingClient.get()
                 .uri(uriBuilder -> uriBuilder
-                        .path("/search/geocode/v6/forward")
-                        .queryParam("q", query)
-                        .queryParam("limit", 5)
-                        .queryParam("autocomplete", false)
-                        .queryParam("access_token", requireMapboxAccessToken())
+                        .path("/maps/api/geocode/json")
+                        .queryParam("address", query)
+                        .queryParam("key", requireGoogleApiKey())
                         .build())
                 .retrieve()
-                .bodyToMono(MapboxGeocodingResponse.class)
-                .flatMapMany(response -> Flux.fromIterable(response.getFeatures() == null ? java.util.List.of() : response.getFeatures()))
-                .filter(feature -> feature.getGeometry() != null
-                        && feature.getGeometry().getCoordinates() != null
-                        && feature.getGeometry().getCoordinates().size() >= 2)
-                .map(feature -> {
-                    var coordinates = feature.getGeometry().getCoordinates();
+                .onStatus(HttpStatusCode::isError, response -> response.bodyToMono(String.class)
+                        .defaultIfEmpty("")
+                        .flatMap(body -> Mono.error(new IllegalStateException(
+                                "Google Geocoding error (" + response.statusCode().value() + "): " + body))))
+                .bodyToMono(GoogleGeocodingResponse.class)
+                .flatMapMany(response -> {
+                    if (!"OK".equals(response.getStatus()) && !"ZERO_RESULTS".equals(response.getStatus())) {
+                        return Flux.error(new IllegalStateException(googleGeocodingErrorMessage(response)));
+                    }
+                    return Flux.fromIterable(response.getResults() == null ? java.util.List.of() : response.getResults());
+                })
+                .filter(result -> result.getGeometry() != null
+                        && result.getGeometry().getLocation() != null
+                        && result.getGeometry().getLocation().getLat() != null
+                        && result.getGeometry().getLocation().getLng() != null)
+                .take(5)
+                .map(result -> {
+                    var location = result.getGeometry().getLocation();
                     return GeocodeResponse.builder()
-                            .displayName(displayName(feature))
-                            .lat(coordinates.get(1))
-                            .lon(coordinates.get(0))
+                            .displayName(displayName(result))
+                            .lat(location.getLat())
+                            .lon(location.getLng())
                             .build();
                 });
     }
@@ -55,31 +65,24 @@ public class GeocodingService {
                 .switchIfEmpty(Mono.error(new IllegalArgumentException("Could not geocode address: " + query)));
     }
 
-    private String displayName(MapboxGeocodingResponse.MapboxFeature feature) {
-        if (feature.getProperties() == null) {
-            return "";
-        }
-
-        String fullAddress = feature.getProperties().getFullAddress();
-        if (StringUtils.hasText(fullAddress)) {
-            return fullAddress;
-        }
-
-        String name = feature.getProperties().getName();
-        String place = feature.getProperties().getPlaceFormatted();
-        if (StringUtils.hasText(name) && StringUtils.hasText(place)) {
-            return name + ", " + place;
-        }
-        if (StringUtils.hasText(name)) {
-            return name;
-        }
-        return StringUtils.hasText(place) ? place : "";
+    private String displayName(GoogleGeocodingResponse.GoogleGeocodingResult result) {
+        return StringUtils.hasText(result.getFormattedAddress()) ? result.getFormattedAddress() : "";
     }
 
-    private String requireMapboxAccessToken() {
-        if (!StringUtils.hasText(mapboxAccessToken)) {
-            throw new IllegalStateException("MAPBOX_ACCESS_TOKEN environment variable is required.");
+    private String googleGeocodingErrorMessage(GoogleGeocodingResponse response) {
+        if (StringUtils.hasText(response.getErrorMessage())) {
+            return "Google Geocoding error: " + response.getErrorMessage();
         }
-        return mapboxAccessToken;
+        if (StringUtils.hasText(response.getStatus())) {
+            return "Google Geocoding returned status: " + response.getStatus();
+        }
+        return "Google Geocoding failed.";
+    }
+
+    private String requireGoogleApiKey() {
+        if (!StringUtils.hasText(googleApiKey)) {
+            throw new IllegalStateException("GOOGLE_API_KEY environment variable is required.");
+        }
+        return googleApiKey;
     }
 }

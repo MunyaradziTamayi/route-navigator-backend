@@ -19,13 +19,10 @@ public class ComputeRouteRequest {
 
     @Data
     public static class Point {
-        @NotNull
         private Double lat;
 
-        @NotNull
         private Double lon;
 
         private String label;
     }
 }
-

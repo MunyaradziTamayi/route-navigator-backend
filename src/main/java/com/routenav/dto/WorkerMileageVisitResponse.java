@@ -22,4 +22,9 @@ public class WorkerMileageVisitResponse {
     private String address;
     private Double lat;
     private Double lon;
+    private String previousAddress;
+    private Double distanceFromPreviousKm;
+    private Double distanceFromPreviousMiles;
+    private Double cumulativeMileageKm;
+    private Double cumulativeMileageMiles;
 }

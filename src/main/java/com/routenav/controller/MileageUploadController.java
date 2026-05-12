@@ -2,6 +2,7 @@ package com.routenav.controller;
 
 import com.routenav.dto.ErrorResponse;
 import com.routenav.dto.WorkerMileageReportResponse;
+import com.routenav.dto.WorkerMileageTotalResponse;
 import com.routenav.dto.WorkerMileageVisitResponse;
 import com.routenav.model.WorkerMileageReport;
 import com.routenav.service.MileageUploadService;
@@ -34,12 +35,9 @@ public class MileageUploadController {
     private final MileageUploadService mileageUploadService;
 
     @PostMapping(value = "/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public Mono<ResponseEntity<Object>> upload(
-            @RequestPart("file") FilePart file,
-            @RequestParam(required = false) String month,
-            @RequestParam(required = false) Integer year) {
-        return mileageUploadService.calculateMonthlyMileageReports(file, month, year)
-                .map(reports -> ResponseEntity.ok((Object) reports))
+    public Mono<ResponseEntity<Object>> upload(@RequestPart("file") FilePart file) {
+        return mileageUploadService.calculateMonthlyMileageTotals(file)
+                .map(totals -> ResponseEntity.ok((Object) totals))
                 .onErrorResume(IllegalArgumentException.class, e -> Mono.just(ResponseEntity.badRequest()
                         .body(ErrorResponse.builder().message(e.getMessage()).build())))
                 .onErrorResume(e -> Mono.just(ResponseEntity.status(HttpStatus.BAD_GATEWAY)
@@ -48,25 +46,32 @@ public class MileageUploadController {
 
     @GetMapping("/reports")
     public Flux<WorkerMileageReportResponse> listReports(
-            @RequestParam(required = false) String month,
-            @RequestParam(required = false) Integer year) {
+            @RequestParam(name = "month", required = false) String month,
+            @RequestParam(name = "year", required = false) Integer year) {
         return mileageUploadService.listReports(month, year);
     }
 
+    @GetMapping("/totals")
+    public Flux<WorkerMileageTotalResponse> getMileageTotals(
+            @RequestParam(name = "month", required = false) String month,
+            @RequestParam(name = "year", required = false) Integer year) {
+        return mileageUploadService.getMileageTotals(month, year);
+    }
+
     @GetMapping("/reports/{id}")
-    public Mono<ResponseEntity<WorkerMileageReportResponse>> getReport(@PathVariable Long id) {
+    public Mono<ResponseEntity<WorkerMileageReportResponse>> getReport(@PathVariable("id") Long id) {
         return mileageUploadService.getReport(id)
                 .map(ResponseEntity::ok)
                 .defaultIfEmpty(ResponseEntity.notFound().build());
     }
 
     @GetMapping("/visits/staff/{staffNumber}")
-    public Flux<WorkerMileageVisitResponse> getVisitsByStaffNumber(@PathVariable String staffNumber) {
+    public Flux<WorkerMileageVisitResponse> getVisitsByStaffNumber(@PathVariable("staffNumber") String staffNumber) {
         return mileageUploadService.getVisitsByStaffNumber(staffNumber);
     }
 
     @GetMapping("/reports/{id}/download")
-    public Mono<ResponseEntity<Object>> downloadReport(@PathVariable Long id) {
+    public Mono<ResponseEntity<Object>> downloadReport(@PathVariable("id") Long id) {
         return mileageUploadService.getReportFile(id)
                 .map(this::toDownloadResponse)
                 .defaultIfEmpty(ResponseEntity.notFound().build());

@@ -17,8 +17,7 @@ public class GeocodingController {
     private final GeocodingService geocodingService;
 
     @GetMapping
-    public Flux<GeocodeResponse> search(@RequestParam String q) {
+    public Flux<GeocodeResponse> search(@RequestParam("q") String q) {
         return geocodingService.search(q);
     }
 }
-

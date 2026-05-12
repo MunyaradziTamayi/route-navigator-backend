@@ -11,14 +11,26 @@ import org.springframework.web.reactive.function.client.WebClient;
 @Configuration
 public class WebClientConfig {
 
-    @Value("${mapbox.base-url}")
-    private String mapboxBaseUrl;
+    @Value("${google.routes-base-url}")
+    private String googleRoutesBaseUrl;
+
+    @Value("${google.geocoding-base-url}")
+    private String googleGeocodingBaseUrl;
 
     @Bean
-    @Qualifier("mapboxClient")
-    public WebClient mapboxWebClient() {
+    @Qualifier("googleRoutesClient")
+    public WebClient googleRoutesWebClient() {
         return WebClient.builder()
-                .baseUrl(mapboxBaseUrl)
+                .baseUrl(googleRoutesBaseUrl)
+                .defaultHeader(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
+                .build();
+    }
+
+    @Bean
+    @Qualifier("googleGeocodingClient")
+    public WebClient googleGeocodingWebClient() {
+        return WebClient.builder()
+                .baseUrl(googleGeocodingBaseUrl)
                 .defaultHeader(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
                 .build();
     }

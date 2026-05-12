@@ -36,7 +36,7 @@ public class VisitsController {
 
     @PutMapping("/{id}")
     public Mono<ResponseEntity<VisitResponse>> update(
-            @PathVariable Long id,
+            @PathVariable("id") Long id,
             @Valid @RequestBody VisitRequest request
     ) {
         return visitService.update(id, request)
@@ -45,7 +45,7 @@ public class VisitsController {
     }
 
     @DeleteMapping("/{id}")
-    public Mono<ResponseEntity<Void>> delete(@PathVariable Long id) {
+    public Mono<ResponseEntity<Void>> delete(@PathVariable("id") Long id) {
         return visitService.delete(id).thenReturn(ResponseEntity.noContent().build());
     }
 }

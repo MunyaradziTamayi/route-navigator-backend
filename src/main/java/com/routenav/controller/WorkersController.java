@@ -35,7 +35,7 @@ public class WorkersController {
     }
 
     @GetMapping("/{id}")
-    public Mono<ResponseEntity<WorkerResponse>> getById(@PathVariable Long id) {
+    public Mono<ResponseEntity<WorkerResponse>> getById(@PathVariable("id") Long id) {
         return workerService.getById(id).map(ResponseEntity::ok).defaultIfEmpty(ResponseEntity.notFound().build());
     }
 
@@ -59,7 +59,7 @@ public class WorkersController {
 
     @PutMapping("/{id}")
     public Mono<ResponseEntity<Object>> update(
-            @PathVariable Long id,
+            @PathVariable("id") Long id,
             @Valid @RequestBody WorkerRequest request
     ) {
         return workerService.update(id, request)
@@ -70,12 +70,12 @@ public class WorkersController {
     }
 
     @DeleteMapping("/{id}")
-    public Mono<ResponseEntity<Void>> delete(@PathVariable Long id) {
+    public Mono<ResponseEntity<Void>> delete(@PathVariable("id") Long id) {
         return workerService.delete(id).thenReturn(ResponseEntity.noContent().build());
     }
 
     @GetMapping("/search")
-    public Flux<WorkerResponse> search(@RequestParam String name) {
+    public Flux<WorkerResponse> search(@RequestParam("name") String name) {
         return workerService.search(name);
     }
 }

@@ -2,6 +2,8 @@ package com.routenav.service;
 
 import com.routenav.dto.WorkerMileageReportResponse;
 import com.routenav.dto.WorkerMileageReportRowResponse;
+import com.routenav.dto.WorkerMileageTotalResponse;
+import com.routenav.dto.WorkerMileageTotalRowResponse;
 import com.routenav.dto.WorkerMileageVisitResponse;
 import com.routenav.model.WorkerMileageReport;
 import com.routenav.model.WorkerMileageReportRow;
@@ -47,6 +49,8 @@ import reactor.core.scheduler.Schedulers;
 @Service
 public class MileageUploadService {
 
+    private static final double KM_TO_MILES = 0.621371;
+
     private static final List<DateTimeFormatter> DATE_FORMATTERS = List.of(
             DateTimeFormatter.ISO_LOCAL_DATE,
             DateTimeFormatter.ofPattern("M/d/yyyy"),
@@ -84,13 +88,11 @@ public class MileageUploadService {
         this.visitRepository = visitRepository;
     }
 
-    public Mono<List<WorkerMileageReportResponse>> calculateMonthlyMileageReports(FilePart file, String reportMonth, Integer year) {
-        ReportMonthFilter filter = parseReportMonthFilter(reportMonth, year);
+    public Mono<List<WorkerMileageReportResponse>> calculateMonthlyMileageReports(FilePart file) {
         return DataBufferUtils.join(file.content())
                 .map(this::toBytes)
                 .flatMap(bytes -> Mono.fromCallable(() -> parseVisits(bytes))
                         .subscribeOn(Schedulers.boundedElastic()))
-                .map(visits -> filterVisitsByReportMonth(visits, filter))
                 .flatMapMany(visits -> Flux.fromIterable(groupVisitsByMonth(visits).entrySet()))
                 .concatMap(entry -> geocodeVisits(entry.getValue())
                         .flatMap(geocodedVisits -> calculateMileage(geocodedVisits)
@@ -100,7 +102,41 @@ public class MileageUploadService {
                 .collectList();
     }
 
+    public Mono<List<WorkerMileageTotalResponse>> calculateMonthlyMileageTotals(FilePart file) {
+        return calculateMonthlyMileageReports(file)
+                .map(this::toUploadedMileageTotalResponses);
+    }
+
     public Flux<WorkerMileageReportResponse> listReports(String reportMonth, Integer year) {
+        return findReports(reportMonth, year).flatMap(this::toReportResponse);
+    }
+
+    public Flux<WorkerMileageTotalResponse> getMileageTotals(String reportMonth, Integer year) {
+        return findReports(reportMonth, year)
+                .flatMap(report -> reportRowRepository.findByReportIdOrderByStaffNumberAsc(report.getId())
+                        .collectList()
+                        .map(rows -> new ReportRows(report, rows)))
+                .collectList()
+                .flatMapMany(reportRows -> {
+                    if (reportRows.isEmpty()) {
+                        return Flux.empty();
+                    }
+
+                    Map<String, List<ReportRows>> reportsByMonth = new TreeMap<>();
+                    for (ReportRows rows : reportRows) {
+                        reportsByMonth.computeIfAbsent(rows.report().getReportMonth(), ignored -> new ArrayList<>()).add(rows);
+                    }
+
+                    List<WorkerMileageTotalResponse> totals = new ArrayList<>();
+                    totals.add(toStoredMileageTotalResponse("all", "Total mileage for all selected months", reportRows));
+                    for (Map.Entry<String, List<ReportRows>> entry : reportsByMonth.entrySet()) {
+                        totals.add(toStoredMileageTotalResponse(entry.getKey(), monthLabel(entry.getKey()), entry.getValue()));
+                    }
+                    return Flux.fromIterable(totals);
+                });
+    }
+
+    private Flux<WorkerMileageReport> findReports(String reportMonth, Integer year) {
         ReportMonthFilter filter = parseReportMonthFilter(reportMonth, year);
         Flux<WorkerMileageReport> reports;
         if (filter == null) {
@@ -117,7 +153,7 @@ public class MileageUploadService {
             reports = reports.filter(report -> reportMonthMatches(report.getReportMonth(), filter.month()));
         }
 
-        return reports.flatMap(this::toReportResponse);
+        return reports;
     }
 
     public Mono<WorkerMileageReportResponse> getReport(Long reportId) {
@@ -130,7 +166,8 @@ public class MileageUploadService {
 
     public Flux<WorkerMileageVisitResponse> getVisitsByStaffNumber(String staffNumber) {
         return visitRepository.findByStaffNumberOrderByVisitDateDescStartTimeDesc(staffNumber)
-                .map(this::toVisitResponse);
+                .collectList()
+                .flatMapMany(visits -> toVisitResponsesWithMileage(visits, false));
     }
 
     private byte[] toBytes(DataBuffer dataBuffer) {
@@ -483,6 +520,103 @@ public class MileageUploadService {
         return Math.round(mileage * 100.0) / 100.0;
     }
 
+    private double kmToMiles(double kilometers) {
+        return roundMileage(kilometers * KM_TO_MILES);
+    }
+
+    private List<WorkerMileageTotalResponse> toUploadedMileageTotalResponses(List<WorkerMileageReportResponse> reports) {
+        if (reports.isEmpty()) {
+            return List.of();
+        }
+
+        Map<String, List<WorkerMileageReportResponse>> reportsByMonth = new TreeMap<>();
+        for (WorkerMileageReportResponse report : reports) {
+            reportsByMonth.computeIfAbsent(report.getReportMonth(), ignored -> new ArrayList<>()).add(report);
+        }
+
+        List<WorkerMileageTotalResponse> totals = new ArrayList<>();
+        totals.add(toUploadedMileageTotalResponse("all", "Total mileage for all uploaded months", reports));
+        for (Map.Entry<String, List<WorkerMileageReportResponse>> entry : reportsByMonth.entrySet()) {
+            totals.add(toUploadedMileageTotalResponse(entry.getKey(), monthLabel(entry.getKey()), entry.getValue()));
+        }
+        return totals;
+    }
+
+    private WorkerMileageTotalResponse toUploadedMileageTotalResponse(String reportMonth, String label, List<WorkerMileageReportResponse> reports) {
+        Map<String, Double> totalsByStaff = new TreeMap<>();
+        double totalMileageKm = 0.0;
+
+        for (WorkerMileageReportResponse report : reports) {
+            for (WorkerMileageReportRowResponse row : report.getRows()) {
+                double rowMileageKm = rowMileageKm(row);
+                totalMileageKm += rowMileageKm;
+                totalsByStaff.merge(row.getStaffNumber(), rowMileageKm, Double::sum);
+            }
+        }
+
+        List<WorkerMileageTotalRowResponse> rows = totalsByStaff.entrySet().stream()
+                .map(entry -> WorkerMileageTotalRowResponse.builder()
+                        .staffNumber(entry.getKey())
+                        .totalMileageMiles(kmToMiles(entry.getValue()))
+                        .build())
+                .toList();
+
+        return WorkerMileageTotalResponse.builder()
+                .reportMonth(reportMonth)
+                .label(label)
+                .totalMileageMiles(kmToMiles(totalMileageKm))
+                .reportCount(reports.size())
+                .rows(rows)
+                .build();
+    }
+
+    private double rowMileageKm(WorkerMileageReportRowResponse row) {
+        if (row.getTotalMileageKm() != null) {
+            return row.getTotalMileageKm();
+        }
+        return row.getTotalMileage() == null ? 0.0 : row.getTotalMileage();
+    }
+
+    private WorkerMileageTotalResponse toStoredMileageTotalResponse(String reportMonth, String label, List<ReportRows> reports) {
+        Map<String, StaffMileageTotals> totalsByStaff = new TreeMap<>();
+        double totalMileage = 0.0;
+
+        for (ReportRows report : reports) {
+            for (WorkerMileageReportRow row : report.rows()) {
+                double rowMileage = row.getTotalMileage() == null ? 0.0 : row.getTotalMileage();
+                totalMileage += rowMileage;
+
+                totalsByStaff.computeIfAbsent(row.getStaffNumber(), ignored -> new StaffMileageTotals())
+                        .add(rowMileage, 0.0);
+            }
+        }
+
+        List<WorkerMileageTotalRowResponse> rows = totalsByStaff.entrySet().stream()
+                .map(entry -> WorkerMileageTotalRowResponse.builder()
+                        .staffNumber(entry.getKey())
+                        .totalMileageMiles(kmToMiles(entry.getValue().totalMileage()))
+                        .build())
+                .toList();
+
+        return WorkerMileageTotalResponse.builder()
+                .reportMonth(reportMonth)
+                .label(label)
+                .totalMileageMiles(kmToMiles(totalMileage))
+                .reportCount(reports.size())
+                .rows(rows)
+                .build();
+    }
+
+    private String monthLabel(String reportMonth) {
+        try {
+            YearMonth yearMonth = YearMonth.parse(reportMonth);
+            return yearMonth.getMonth().getDisplayName(java.time.format.TextStyle.FULL, Locale.ENGLISH)
+                    + " " + yearMonth.getYear();
+        } catch (DateTimeParseException e) {
+            return reportMonth;
+        }
+    }
+
     private byte[] buildWorkbook(List<MileageResult> results) throws IOException {
         try (Workbook workbook = new XSSFWorkbook(); ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
             Sheet sheet = workbook.createSheet("Mileage Results");
@@ -557,32 +691,86 @@ public class MileageUploadService {
                 .collectList();
 
         return Mono.zip(rows, visits)
-                .map(tuple -> {
+                .flatMap(tuple -> {
                     Map<String, Double> straightLineMileageByStaff = straightLineMileageByStaff(tuple.getT2());
                     List<WorkerMileageReportRowResponse> rowResponses = tuple.getT1().stream()
                             .map(row -> WorkerMileageReportRowResponse.builder()
                                     .staffNumber(row.getStaffNumber())
                                     .totalMileage(row.getTotalMileage())
+                                    .totalMileageKm(row.getTotalMileage())
+                                    .totalMileageMiles(kmToMiles(row.getTotalMileage() == null ? 0.0 : row.getTotalMileage()))
                                     .totalStraightLineMileage(roundMileage(straightLineMileageByStaff.getOrDefault(row.getStaffNumber(), 0.0)))
+                                    .totalStraightLineMileageKm(roundMileage(straightLineMileageByStaff.getOrDefault(row.getStaffNumber(), 0.0)))
+                                    .totalStraightLineMileageMiles(kmToMiles(straightLineMileageByStaff.getOrDefault(row.getStaffNumber(), 0.0)))
                                     .build())
                             .toList();
-                    List<WorkerMileageVisitResponse> visitResponses = tuple.getT2().stream()
-                            .map(this::toVisitResponse)
-                            .toList();
-
-                    return WorkerMileageReportResponse.builder()
-                            .id(report.getId())
-                            .reportMonth(report.getReportMonth())
-                            .fileName(report.getFileName())
-                            .downloadUrl("/api/mileage/reports/" + report.getId() + "/download")
-                            .createdAt(report.getCreatedAt())
-                            .rows(rowResponses)
-                            .visits(visitResponses)
-                            .build();
+                    return toVisitResponsesWithMileage(tuple.getT2(), true)
+                            .collectList()
+                            .map(visitResponses -> WorkerMileageReportResponse.builder()
+                                    .id(report.getId())
+                                    .reportMonth(report.getReportMonth())
+                                    .fileName(report.getFileName())
+                                    .downloadUrl("/api/mileage/reports/" + report.getId() + "/download")
+                                    .createdAt(report.getCreatedAt())
+                                    .rows(rowResponses)
+                                    .visits(visitResponses)
+                                    .build());
                 });
     }
 
-    private WorkerMileageVisitResponse toVisitResponse(WorkerMileageVisit visit) {
+    private Flux<WorkerMileageVisitResponse> toVisitResponsesWithMileage(List<WorkerMileageVisit> visits, boolean ascending) {
+        Map<String, List<WorkerMileageVisit>> visitsByStaff = new LinkedHashMap<>();
+        List<WorkerMileageVisit> orderedVisits = visits.stream()
+                .sorted(Comparator.comparing(WorkerMileageVisit::getStaffNumber)
+                        .thenComparing(WorkerMileageVisit::getVisitDate)
+                        .thenComparing(WorkerMileageVisit::getStartTime, Comparator.nullsLast(Comparator.naturalOrder()))
+                        .thenComparing(visit -> visit.getId() == null ? 0L : visit.getId()))
+                .toList();
+
+        for (WorkerMileageVisit visit : orderedVisits) {
+            visitsByStaff.computeIfAbsent(visit.getStaffNumber(), ignored -> new ArrayList<>()).add(visit);
+        }
+
+        Flux<WorkerMileageVisitResponse> responses = Flux.fromIterable(visitsByStaff.values())
+                .concatMap(this::toStaffVisitResponsesWithMileage);
+
+        return ascending ? responses : responses.sort(Comparator.comparing(WorkerMileageVisitResponse::getVisitDate).reversed()
+                .thenComparing(WorkerMileageVisitResponse::getStartTime, Comparator.nullsLast(Comparator.reverseOrder())));
+    }
+
+    private Flux<WorkerMileageVisitResponse> toStaffVisitResponsesWithMileage(List<WorkerMileageVisit> visits) {
+        double[] cumulativeMileage = {0.0};
+
+        return Flux.range(0, visits.size())
+                .concatMap(index -> {
+                    WorkerMileageVisit current = visits.get(index);
+                    if (index == 0) {
+                        return Mono.just(toVisitResponse(current, null, 0.0, 0.0));
+                    }
+
+                    WorkerMileageVisit previous = visits.get(index - 1);
+                    return distanceBetween(previous, current)
+                            .map(distance -> {
+                                double roundedDistance = roundMileage(distance);
+                                cumulativeMileage[0] = roundMileage(cumulativeMileage[0] + roundedDistance);
+                                return toVisitResponse(current, previous.getAddress(), roundedDistance, cumulativeMileage[0]);
+                            });
+                });
+    }
+
+    private Mono<Double> distanceBetween(WorkerMileageVisit previous, WorkerMileageVisit current) {
+        if (previous.getLat() == null || previous.getLon() == null
+                || current.getLat() == null || current.getLon() == null) {
+            return Mono.just(0.0);
+        }
+
+        return routingService.calculateDistanceKm(previous.getLat(), previous.getLon(), current.getLat(), current.getLon())
+                .defaultIfEmpty(0.0)
+                .onErrorReturn(0.0);
+    }
+
+    private WorkerMileageVisitResponse toVisitResponse(WorkerMileageVisit visit, String previousAddress,
+                                                       double distanceFromPreviousKm, double cumulativeMileageKm) {
         return WorkerMileageVisitResponse.builder()
                 .id(visit.getId())
                 .reportId(visit.getReportId())
@@ -593,6 +781,11 @@ public class MileageUploadService {
                 .address(visit.getAddress())
                 .lat(visit.getLat())
                 .lon(visit.getLon())
+                .previousAddress(previousAddress)
+                .distanceFromPreviousKm(distanceFromPreviousKm)
+                .distanceFromPreviousMiles(kmToMiles(distanceFromPreviousKm))
+                .cumulativeMileageKm(cumulativeMileageKm)
+                .cumulativeMileageMiles(kmToMiles(cumulativeMileageKm))
                 .build();
     }
 
@@ -627,5 +820,27 @@ public class MileageUploadService {
     }
 
     private record ParsedMonthYear(int month, int year) {
+    }
+
+    private record ReportRows(WorkerMileageReport report, List<WorkerMileageReportRow> rows) {
+    }
+
+    private static class StaffMileageTotals {
+
+        private double totalMileage;
+        private double totalStraightLineMileage;
+
+        private void add(double mileage, double straightLineMileage) {
+            totalMileage += mileage;
+            totalStraightLineMileage += straightLineMileage;
+        }
+
+        private double totalMileage() {
+            return totalMileage;
+        }
+
+        private double totalStraightLineMileage() {
+            return totalStraightLineMileage;
+        }
     }
 }
