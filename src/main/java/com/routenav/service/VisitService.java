@@ -2,7 +2,6 @@ package com.routenav.service;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.routenav.dto.GeocodeResponse;
 import com.routenav.dto.VisitRequest;
 import com.routenav.dto.VisitResponse;
 import com.routenav.model.Visit;
@@ -47,10 +46,10 @@ public class VisitService {
 
     private static final List<DateTimeFormatter> DATE_FORMATTERS = List.of(
             DateTimeFormatter.ISO_LOCAL_DATE,
-            DateTimeFormatter.ofPattern("M/d/yyyy"),
             DateTimeFormatter.ofPattern("d/M/yyyy"),
-            DateTimeFormatter.ofPattern("M-d-yyyy"),
-            DateTimeFormatter.ofPattern("d-M-yyyy")
+            DateTimeFormatter.ofPattern("M/d/yyyy"),
+            DateTimeFormatter.ofPattern("d-M-yyyy"),
+            DateTimeFormatter.ofPattern("M-d-yyyy")
     );
 
     private static final List<DateTimeFormatter> TIME_FORMATTERS = List.of(
@@ -62,7 +61,6 @@ public class VisitService {
 
     private final VisitRepository visitRepository;
     private final ObjectMapper objectMapper;
-    private final GeocodingService geocodingService;
     private final WorkerRepository workerRepository;
 
     public Flux<VisitResponse> list() {
@@ -81,8 +79,7 @@ public class VisitService {
                 .flatMap(bytes -> Mono.fromCallable(() -> parseScheduleRows(bytes))
                         .subscribeOn(Schedulers.boundedElastic()))
                 .flatMap(rows -> Flux.fromIterable(rows)
-                        .concatMap(row -> geocodingService.geocodeFirst(row.address())
-                                .flatMap(destination -> saveUploadedVisit(row, destination)))
+                        .concatMap(this::saveUploadedVisit)
                         .collectList());
     }
 
@@ -143,7 +140,7 @@ public class VisitService {
         return visitRepository.deleteById(id);
     }
 
-    private Mono<VisitResponse> saveUploadedVisit(ScheduleVisitRow row, GeocodeResponse destination) {
+    private Mono<VisitResponse> saveUploadedVisit(ScheduleVisitRow row) {
         int defaultDurationMinutes = 30;
         LocalTime endTime = row.endTime() == null ? row.startTime().plusMinutes(defaultDurationMinutes) : row.endTime();
         int durationSeconds = durationSeconds(row.startTime(), endTime, defaultDurationMinutes);
@@ -151,11 +148,11 @@ public class VisitService {
 
         Visit visit = Visit.builder()
                 .originLabel(null)
-                .destinationLabel(destination.getDisplayName())
+                .destinationLabel(row.address())
                 .originLat(null)
                 .originLon(null)
-                .destinationLat(destination.getLat())
-                .destinationLon(destination.getLon())
+                .destinationLat(null)
+                .destinationLon(null)
                 .clientLabel(row.address())
                 .notes("")
                 .scheduledDate(LocalDateTime.of(row.date(), row.startTime()))

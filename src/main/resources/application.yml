@@ -19,3 +19,8 @@ google:
   api-key: ${GOOGLE_API_KEY:}
   routes-base-url: https://routes.googleapis.com
   geocoding-base-url: https://maps.googleapis.com
+
+  security:
+    user:
+      name: admin
+      password: admin123
