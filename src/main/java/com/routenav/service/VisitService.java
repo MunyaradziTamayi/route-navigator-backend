@@ -6,7 +6,9 @@ import com.routenav.dto.GeocodeResponse;
 import com.routenav.dto.VisitRequest;
 import com.routenav.dto.VisitResponse;
 import com.routenav.model.Visit;
+import com.routenav.model.Worker;
 import com.routenav.repository.VisitRepository;
+import com.routenav.repository.WorkerRepository;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.time.Duration;
@@ -16,7 +18,7 @@ import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
-import java.util.Arrays;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
@@ -61,6 +63,7 @@ public class VisitService {
     private final VisitRepository visitRepository;
     private final ObjectMapper objectMapper;
     private final GeocodingService geocodingService;
+    private final WorkerRepository workerRepository;
 
     public Flux<VisitResponse> list() {
         return visitRepository.findAllByOrderByCreatedAtDesc().map(this::toResponse);
@@ -72,33 +75,54 @@ public class VisitService {
         return visitRepository.save(visit).map(this::toResponse);
     }
 
-    public Mono<List<VisitResponse>> upload(FilePart file, String workerIdsValue, String workerNamesValue,
-                                            String originLabel, String durationMinutesValue) {
-        List<String> workerIds = parseStringList(workerIdsValue);
-        List<String> workerNames = parseStringList(workerNamesValue);
-        if (workerIds.isEmpty() || workerNames.isEmpty()) {
-            return Mono.error(new IllegalArgumentException("Choose at least one worker before uploading visits."));
-        }
-        if (!StringUtils.hasText(originLabel)) {
-            return Mono.error(new IllegalArgumentException("Origin address is required for uploaded visits."));
-        }
-
-        int durationMinutes = parseDurationMinutes(durationMinutesValue);
+    public Mono<List<VisitResponse>> upload(FilePart file) {
         return DataBufferUtils.join(file.content())
                 .map(this::toBytes)
                 .flatMap(bytes -> Mono.fromCallable(() -> parseScheduleRows(bytes))
                         .subscribeOn(Schedulers.boundedElastic()))
-                .flatMap(rows -> geocodingService.geocodeFirst(originLabel.trim())
-                        .flatMapMany(origin -> Flux.fromIterable(rows)
-                                .concatMap(row -> geocodingService.geocodeFirst(row.address())
-                                        .flatMap(destination -> saveUploadedVisit(
-                                                row,
-                                                origin,
-                                                destination,
-                                                workerIds,
-                                                workerNames,
-                                                durationMinutes))))
+                .flatMap(rows -> Flux.fromIterable(rows)
+                        .concatMap(row -> geocodingService.geocodeFirst(row.address())
+                                .flatMap(destination -> saveUploadedVisit(row, destination)))
                         .collectList());
+    }
+
+    public Mono<List<VisitResponse>> assignStaff() {
+        Mono<List<Worker>> workers = workerRepository.findAllByOrderByCreatedAtDesc()
+                .sort(Comparator.comparing(Worker::getName, Comparator.nullsLast(String::compareToIgnoreCase)))
+                .collectList();
+
+        Mono<List<Visit>> unassignedVisits = visitRepository.findAll()
+                .filter(this::isUnassigned)
+                .sort(Comparator.comparing(Visit::getScheduledDate, Comparator.nullsLast(Comparator.naturalOrder()))
+                        .thenComparing(Visit::getStartTime, Comparator.nullsLast(Comparator.naturalOrder()))
+                        .thenComparing(visit -> visit.getId() == null ? 0L : visit.getId()))
+                .collectList();
+
+        return Mono.zip(workers, unassignedVisits)
+                .flatMap(tuple -> {
+                    List<Worker> availableWorkers = tuple.getT1();
+                    List<Visit> visits = tuple.getT2();
+                    if (availableWorkers.isEmpty()) {
+                        return Mono.error(new IllegalArgumentException("Add workers before assigning visits."));
+                    }
+                    if (visits.isEmpty()) {
+                        return Mono.just(List.of());
+                    }
+
+                    LocalDateTime now = LocalDateTime.now();
+                    for (int i = 0; i < visits.size(); i++) {
+                        Visit visit = visits.get(i);
+                        Worker worker = availableWorkers.get(i % availableWorkers.size());
+                        visit.setWorkerIds(toJson(List.of(String.valueOf(worker.getId()))));
+                        visit.setWorkerNames(toJson(List.of(worker.getName())));
+                        visit.setUpdatedAt(now);
+                    }
+
+                    return Flux.fromIterable(visits)
+                            .concatMap(visitRepository::save)
+                            .map(this::toResponse)
+                            .collectList();
+                });
     }
 
     public Mono<VisitResponse> update(Long id, VisitRequest request) {
@@ -119,30 +143,28 @@ public class VisitService {
         return visitRepository.deleteById(id);
     }
 
-    private Mono<VisitResponse> saveUploadedVisit(ScheduleVisitRow row, GeocodeResponse origin,
-                                                  GeocodeResponse destination, List<String> workerIds,
-                                                  List<String> workerNames, int durationMinutes) {
-        LocalTime endTime = row.endTime() == null ? row.startTime().plusMinutes(durationMinutes) : row.endTime();
-        int durationSeconds = durationSeconds(row.startTime(), endTime, durationMinutes);
-        double directDistanceKm = haversineDistanceKm(origin.getLat(), origin.getLon(), destination.getLat(), destination.getLon());
+    private Mono<VisitResponse> saveUploadedVisit(ScheduleVisitRow row, GeocodeResponse destination) {
+        int defaultDurationMinutes = 30;
+        LocalTime endTime = row.endTime() == null ? row.startTime().plusMinutes(defaultDurationMinutes) : row.endTime();
+        int durationSeconds = durationSeconds(row.startTime(), endTime, defaultDurationMinutes);
         LocalDateTime now = LocalDateTime.now();
 
         Visit visit = Visit.builder()
-                .originLabel(origin.getDisplayName())
+                .originLabel(null)
                 .destinationLabel(destination.getDisplayName())
-                .originLat(origin.getLat())
-                .originLon(origin.getLon())
+                .originLat(null)
+                .originLon(null)
                 .destinationLat(destination.getLat())
                 .destinationLon(destination.getLon())
                 .clientLabel(row.address())
                 .notes("")
                 .scheduledDate(LocalDateTime.of(row.date(), row.startTime()))
-                .workerIds(toJson(workerIds))
-                .workerNames(toJson(workerNames))
+                .workerIds(toJson(List.of()))
+                .workerNames(toJson(List.of()))
                 .startTime(row.startTime())
                 .endTime(endTime)
                 .visitsPerDay(1)
-                .distanceKm(directDistanceKm)
+                .distanceKm(0.0)
                 .durationSeconds(durationSeconds)
                 .geometry(toJson(null))
                 .status("pending")
@@ -150,12 +172,7 @@ public class VisitService {
                 .updatedAt(now)
                 .build();
 
-        return visitRepository.save(visit)
-                .map(saved -> {
-                    VisitResponse response = toResponse(saved);
-                    response.setStraightLineDistanceKm(directDistanceKm);
-                    return response;
-                });
+        return visitRepository.save(visit).map(this::toResponse);
     }
 
     private Visit toEntity(VisitRequest request, Long id, LocalDateTime createdAt, LocalDateTime updatedAt) {
@@ -219,29 +236,8 @@ public class VisitService {
         }
     }
 
-    private List<String> parseStringList(String value) {
-        if (!StringUtils.hasText(value)) {
-            return List.of();
-        }
-        try {
-            return objectMapper.readValue(value, new TypeReference<List<String>>() {});
-        } catch (Exception ignored) {
-            return Arrays.stream(value.split(","))
-                    .map(String::trim)
-                    .filter(item -> !item.isBlank())
-                    .toList();
-        }
-    }
-
-    private int parseDurationMinutes(String value) {
-        if (!StringUtils.hasText(value)) {
-            return 30;
-        }
-        try {
-            return Math.max(1, Integer.parseInt(value.trim()));
-        } catch (NumberFormatException e) {
-            throw new IllegalArgumentException("Duration minutes must be a whole number.");
-        }
+    private boolean isUnassigned(Visit visit) {
+        return fromJsonList(visit.getWorkerIds()).isEmpty();
     }
 
     private byte[] toBytes(DataBuffer dataBuffer) {

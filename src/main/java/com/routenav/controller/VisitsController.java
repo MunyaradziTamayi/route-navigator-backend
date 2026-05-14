@@ -39,14 +39,16 @@ public class VisitsController {
     }
 
     @PostMapping(value = "/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public Mono<ResponseEntity<Object>> upload(
-            @RequestPart("file") FilePart file,
-            @RequestPart("workerIds") String workerIds,
-            @RequestPart("workerNames") String workerNames,
-            @RequestPart("originLabel") String originLabel,
-            @RequestPart(name = "durationMinutes", required = false) String durationMinutes
-    ) {
-        return visitService.upload(file, workerIds, workerNames, originLabel, durationMinutes)
+    public Mono<ResponseEntity<Object>> upload(@RequestPart("file") FilePart file) {
+        return visitService.upload(file)
+                .map(visits -> ResponseEntity.ok((Object) visits))
+                .onErrorResume(IllegalArgumentException.class, e -> Mono.just(ResponseEntity.badRequest().body(e.getMessage())))
+                .onErrorResume(e -> Mono.just(ResponseEntity.status(HttpStatus.BAD_GATEWAY).body(e.getMessage())));
+    }
+
+    @PostMapping("/assign-staff")
+    public Mono<ResponseEntity<Object>> assignStaff() {
+        return visitService.assignStaff()
                 .map(visits -> ResponseEntity.ok((Object) visits))
                 .onErrorResume(IllegalArgumentException.class, e -> Mono.just(ResponseEntity.badRequest().body(e.getMessage())))
                 .onErrorResume(e -> Mono.just(ResponseEntity.status(HttpStatus.BAD_GATEWAY).body(e.getMessage())));
