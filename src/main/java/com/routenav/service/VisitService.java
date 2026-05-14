@@ -111,9 +111,10 @@ public class VisitService {
                     }
 
                     LocalDateTime now = LocalDateTime.now();
+                    int blockSize = (int) Math.ceil((double) visits.size() / availableWorkers.size());
                     for (int i = 0; i < visits.size(); i++) {
                         Visit visit = visits.get(i);
-                        Worker worker = availableWorkers.get(i % availableWorkers.size());
+                        Worker worker = availableWorkers.get(Math.min(i / blockSize, availableWorkers.size() - 1));
                         visit.setWorkerIds(toJson(List.of(String.valueOf(worker.getId()))));
                         visit.setWorkerNames(toJson(List.of(worker.getName())));
                         visit.setUpdatedAt(now);
