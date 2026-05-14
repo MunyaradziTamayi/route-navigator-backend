@@ -61,6 +61,7 @@ public class VisitService {
             DateTimeFormatter.ofPattern("h:mm a", Locale.ENGLISH),
             DateTimeFormatter.ofPattern("h:mm:ss a", Locale.ENGLISH)
     );
+    private static final DateTimeFormatter SCHEDULE_DOWNLOAD_DATE_FORMATTER = DateTimeFormatter.ofPattern("M/d/yyyy");
 
     private final VisitRepository visitRepository;
     private final ObjectMapper objectMapper;
@@ -91,14 +92,14 @@ public class VisitService {
                 .sort(Comparator.comparing(Worker::getName, Comparator.nullsLast(String::compareToIgnoreCase)))
                 .collectList();
 
-        Mono<List<Visit>> unassignedVisits = visitRepository.findAll()
-                .filter(this::isUnassigned)
+        Mono<List<Visit>> pendingVisits = visitRepository.findAll()
+                .filter(this::isPending)
                 .sort(Comparator.comparing(Visit::getScheduledDate, Comparator.nullsLast(Comparator.naturalOrder()))
                         .thenComparing(Visit::getStartTime, Comparator.nullsLast(Comparator.naturalOrder()))
                         .thenComparing(visit -> visit.getId() == null ? 0L : visit.getId()))
                 .collectList();
 
-        return Mono.zip(workers, unassignedVisits)
+        return Mono.zip(workers, pendingVisits)
                 .flatMap(tuple -> {
                     List<Worker> availableWorkers = tuple.getT1();
                     List<Visit> visits = tuple.getT2();
@@ -126,14 +127,17 @@ public class VisitService {
     }
 
     public Mono<byte[]> buildScheduleWorkbook(LocalDate date) {
-        return visitRepository.findAll()
+        Mono<List<Visit>> visits = visitRepository.findAll()
                 .filter(visit -> date == null || (visit.getScheduledDate() != null
                         && date.equals(visit.getScheduledDate().toLocalDate())))
                 .sort(Comparator.comparing(Visit::getScheduledDate, Comparator.nullsLast(Comparator.naturalOrder()))
                         .thenComparing(Visit::getStartTime, Comparator.nullsLast(Comparator.naturalOrder()))
                         .thenComparing(visit -> visit.getId() == null ? 0L : visit.getId()))
-                .collectList()
-                .flatMap(visits -> Mono.fromCallable(() -> buildScheduleWorkbookBytes(visits))
+                .collectList();
+        Mono<List<Worker>> workers = workerRepository.findAllByOrderByCreatedAtDesc().collectList();
+
+        return Mono.zip(visits, workers)
+                .flatMap(tuple -> Mono.fromCallable(() -> buildScheduleWorkbookBytes(tuple.getT1(), tuple.getT2()))
                         .subscribeOn(Schedulers.boundedElastic()));
     }
 
@@ -250,6 +254,10 @@ public class VisitService {
 
     private boolean isUnassigned(Visit visit) {
         return fromJsonList(visit.getWorkerIds()).isEmpty();
+    }
+
+    private boolean isPending(Visit visit) {
+        return visit.getStatus() == null || visit.getStatus().isBlank() || "pending".equalsIgnoreCase(visit.getStatus());
     }
 
     private byte[] toBytes(DataBuffer dataBuffer) {
@@ -386,7 +394,7 @@ public class VisitService {
         return (int) (seconds > 0 ? seconds : fallbackMinutes * 60L);
     }
 
-    private byte[] buildScheduleWorkbookBytes(List<Visit> visits) throws IOException {
+    private byte[] buildScheduleWorkbookBytes(List<Visit> visits, List<Worker> workers) throws IOException {
         try (Workbook workbook = new XSSFWorkbook(); ByteArrayOutputStream output = new ByteArrayOutputStream()) {
             Sheet sheet = workbook.createSheet("Schedule");
             CellStyle headerStyle = workbook.createCellStyle();
@@ -395,7 +403,7 @@ public class VisitService {
             headerStyle.setFont(headerFont);
 
             Row header = sheet.createRow(0);
-            List<String> headers = List.of("Date", "Visit Time", "Address", "Assigned Worker(s)", "Status", "Notes");
+            List<String> headers = List.of("Staff Number", "Date", "visit time", "Address");
             for (int i = 0; i < headers.size(); i++) {
                 Cell cell = header.createCell(i);
                 cell.setCellValue(headers.get(i));
@@ -403,14 +411,22 @@ public class VisitService {
             }
 
             int rowIndex = 1;
+            Map<String, String> staffNumbersByWorkerId = staffNumbersByWorkerId(workers);
             for (Visit visit : visits) {
-                Row row = sheet.createRow(rowIndex++);
-                row.createCell(0).setCellValue(formatScheduleDate(visit));
-                row.createCell(1).setCellValue(formatVisitTimeRange(visit));
-                row.createCell(2).setCellValue(blankToDefault(visit.getDestinationLabel(), visit.getClientLabel()));
-                row.createCell(3).setCellValue(workerNamesLabel(visit));
-                row.createCell(4).setCellValue(blankToDefault(visit.getStatus(), "pending"));
-                row.createCell(5).setCellValue(blankToDefault(visit.getNotes(), ""));
+                List<String> workerIds = fromJsonList(visit.getWorkerIds());
+                List<String> staffNumbers = workerIds.isEmpty()
+                        ? List.of("")
+                        : workerIds.stream()
+                                .map(workerId -> staffNumbersByWorkerId.getOrDefault(workerId, workerId))
+                                .toList();
+
+                for (String staffNumber : staffNumbers) {
+                    Row row = sheet.createRow(rowIndex++);
+                    row.createCell(0).setCellValue(staffNumber);
+                    row.createCell(1).setCellValue(formatScheduleDate(visit));
+                    row.createCell(2).setCellValue(formatVisitTimeRange(visit));
+                    row.createCell(3).setCellValue(blankToDefault(visit.getDestinationLabel(), visit.getClientLabel()));
+                }
             }
 
             for (int i = 0; i < headers.size(); i++) {
@@ -424,14 +440,14 @@ public class VisitService {
 
     private String formatScheduleDate(Visit visit) {
         if (visit.getScheduledDate() != null) {
-            return visit.getScheduledDate().toLocalDate().toString();
+            return visit.getScheduledDate().toLocalDate().format(SCHEDULE_DOWNLOAD_DATE_FORMATTER);
         }
         return "";
     }
 
     private String formatVisitTimeRange(Visit visit) {
         if (visit.getStartTime() != null && visit.getEndTime() != null) {
-            return visit.getStartTime() + " - " + visit.getEndTime();
+            return visit.getStartTime() + "-" + visit.getEndTime();
         }
         if (visit.getStartTime() != null) {
             return visit.getStartTime().toString();
@@ -439,9 +455,14 @@ public class VisitService {
         return visit.getEndTime() == null ? "" : visit.getEndTime().toString();
     }
 
-    private String workerNamesLabel(Visit visit) {
-        List<String> workerNames = fromJsonList(visit.getWorkerNames());
-        return workerNames.isEmpty() ? "Unassigned" : String.join(", ", workerNames);
+    private Map<String, String> staffNumbersByWorkerId(List<Worker> workers) {
+        Map<String, String> staffNumbers = new HashMap<>();
+        for (Worker worker : workers) {
+            if (worker.getId() != null) {
+                staffNumbers.put(String.valueOf(worker.getId()), blankToDefault(worker.getStaffNumber(), ""));
+            }
+        }
+        return staffNumbers;
     }
 
     private String blankToDefault(String value, String defaultValue) {
