@@ -17,6 +17,8 @@ import com.routenav.repository.WorkerMileageVisitRepository;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
@@ -34,6 +36,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.TreeMap;
+import java.util.HexFormat;
 import org.apache.poi.ss.usermodel.Cell;
 import org.apache.poi.ss.usermodel.CellType;
 import org.apache.poi.ss.usermodel.DataFormatter;
@@ -97,14 +100,14 @@ public class MileageUploadService {
     }
 
     public Mono<List<WorkerMileageReportResponse>> calculateMonthlyMileageReports(FilePart file) {
-        return calculateMonthlyMileageReports(file, null);
-    }
-
-    private Mono<List<WorkerMileageReportResponse>> calculateMonthlyMileageReports(FilePart file, Long uploadId) {
         return DataBufferUtils.join(file.content())
                 .map(this::toBytes)
-                .flatMap(bytes -> Mono.fromCallable(() -> parseVisits(bytes))
-                        .subscribeOn(Schedulers.boundedElastic()))
+                .flatMap(bytes -> calculateMonthlyMileageReports(bytes, null));
+    }
+
+    private Mono<List<WorkerMileageReportResponse>> calculateMonthlyMileageReports(byte[] bytes, Long uploadId) {
+        return Mono.fromCallable(() -> parseVisits(bytes))
+                .subscribeOn(Schedulers.boundedElastic())
                 .flatMapMany(visits -> Flux.fromIterable(groupVisitsByMonth(visits).entrySet()))
                 .concatMap(entry -> geocodeVisits(entry.getValue())
                         .flatMap(geocodedVisits -> calculateMileage(geocodedVisits)
@@ -120,9 +123,16 @@ public class MileageUploadService {
     }
 
     public Mono<WorkerMileageUploadResponse> calculateMonthlyMileageUpload(FilePart file) {
-        return saveUpload(file.filename())
-                .flatMap(upload -> calculateMonthlyMileageReports(file, upload.getId())
-                        .map(reports -> toUploadResponse(upload, reports, true)));
+        return DataBufferUtils.join(file.content())
+                .map(this::toBytes)
+                .flatMap(bytes -> {
+                    String fileHash = sha256Hex(bytes);
+                    return uploadRepository.findFirstByFileHashOrderByCreatedAtDesc(fileHash)
+                            .flatMap(existingUpload -> getUpload(existingUpload.getId()))
+                            .switchIfEmpty(saveUpload(file.filename(), fileHash)
+                                    .flatMap(upload -> calculateMonthlyMileageReports(bytes, upload.getId())
+                                            .map(reports -> toUploadResponse(upload, reports, true))));
+                });
     }
 
     public Flux<WorkerMileageReportResponse> listReports(String reportMonth, Integer year) {
@@ -141,13 +151,14 @@ public class MileageUploadService {
                         return Flux.empty();
                     }
 
+                    List<ReportRows> latestReportRows = latestReportRowsByMonth(reportRows);
                     Map<String, List<ReportRows>> reportsByMonth = new TreeMap<>();
-                    for (ReportRows rows : reportRows) {
+                    for (ReportRows rows : latestReportRows) {
                         reportsByMonth.computeIfAbsent(rows.report().getReportMonth(), ignored -> new ArrayList<>()).add(rows);
                     }
 
                     List<WorkerMileageTotalResponse> totals = new ArrayList<>();
-                    totals.add(toStoredMileageTotalResponse("all", "Total mileage for all selected months", reportRows));
+                    totals.add(toStoredMileageTotalResponse("all", "Total mileage for all selected months", latestReportRows));
                     for (Map.Entry<String, List<ReportRows>> entry : reportsByMonth.entrySet()) {
                         totals.add(toStoredMileageTotalResponse(entry.getKey(), monthLabel(entry.getKey()), entry.getValue()));
                     }
@@ -172,11 +183,20 @@ public class MileageUploadService {
                         .map(reports -> toUploadResponse(upload, reports, true)));
     }
 
-    private Mono<WorkerMileageUpload> saveUpload(String fileName) {
+    private Mono<WorkerMileageUpload> saveUpload(String fileName, String fileHash) {
         return uploadRepository.save(WorkerMileageUpload.builder()
                 .fileName(fileName == null || fileName.isBlank() ? "worker-mileage-upload.xlsx" : fileName)
+                .fileHash(fileHash)
                 .createdAt(LocalDateTime.now())
                 .build());
+    }
+
+    private String sha256Hex(byte[] bytes) {
+        try {
+            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 hashing is not available.", e);
+        }
     }
 
     private Flux<WorkerMileageReport> findReports(String reportMonth, Integer year) {
@@ -736,6 +756,37 @@ public class MileageUploadService {
         } catch (DateTimeParseException e) {
             return reportMonth;
         }
+    }
+
+    private List<ReportRows> latestReportRowsByMonth(List<ReportRows> reports) {
+        Map<String, ReportRows> latestByMonth = new TreeMap<>();
+        for (ReportRows rows : reports) {
+            String reportMonth = rows.report().getReportMonth();
+            ReportRows current = latestByMonth.get(reportMonth);
+            if (current == null || isNewerReport(rows.report(), current.report())) {
+                latestByMonth.put(reportMonth, rows);
+            }
+        }
+        return new ArrayList<>(latestByMonth.values());
+    }
+
+    private boolean isNewerReport(WorkerMileageReport candidate, WorkerMileageReport current) {
+        LocalDateTime candidateCreatedAt = candidate.getCreatedAt();
+        LocalDateTime currentCreatedAt = current.getCreatedAt();
+        if (candidateCreatedAt != null && currentCreatedAt != null) {
+            int comparison = candidateCreatedAt.compareTo(currentCreatedAt);
+            if (comparison != 0) {
+                return comparison > 0;
+            }
+        } else if (candidateCreatedAt != null) {
+            return true;
+        } else if (currentCreatedAt != null) {
+            return false;
+        }
+
+        long candidateId = candidate.getId() == null ? Long.MIN_VALUE : candidate.getId();
+        long currentId = current.getId() == null ? Long.MIN_VALUE : current.getId();
+        return candidateId > currentId;
     }
 
     private byte[] buildWorkbook(List<MileageResult> results) throws IOException {

@@ -2,6 +2,10 @@ package com.routenav.service;
 
 import com.routenav.dto.GeocodeResponse;
 import com.routenav.dto.GoogleGeocodingResponse;
+import com.routenav.model.GeocodedAddress;
+import com.routenav.repository.GeocodedAddressRepository;
+import java.time.LocalDateTime;
+import java.util.Locale;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatusCode;
@@ -18,10 +22,14 @@ public class GeocodingService {
 
     private final String googleApiKey;
 
+    private final GeocodedAddressRepository geocodedAddressRepository;
+
     public GeocodingService(@Qualifier("googleGeocodingClient") WebClient googleGeocodingClient,
-                            @Value("${google.api-key}") String googleApiKey) {
+                            @Value("${google.api-key}") String googleApiKey,
+                            GeocodedAddressRepository geocodedAddressRepository) {
         this.googleGeocodingClient = googleGeocodingClient;
         this.googleApiKey = googleApiKey;
+        this.geocodedAddressRepository = geocodedAddressRepository;
     }
 
     public Flux<GeocodeResponse> search(String query) {
@@ -59,10 +67,45 @@ public class GeocodingService {
     }
 
     public Mono<GeocodeResponse> geocodeFirst(String query) {
+        String normalizedAddress = normalizeAddress(query);
+        return findCachedAddress(normalizedAddress)
+                .map(this::toGeocodeResponse)
+                .switchIfEmpty(fetchAndCacheFirst(query, normalizedAddress));
+    }
+
+    private Mono<GeocodedAddress> findCachedAddress(String normalizedAddress) {
+        return geocodedAddressRepository.findByNormalizedAddress(normalizedAddress)
+                .onErrorResume(error -> Mono.empty());
+    }
+
+    private Mono<GeocodeResponse> fetchAndCacheFirst(String query, String normalizedAddress) {
         return search(query)
                 .filter(result -> result.getLat() != null && result.getLon() != null)
                 .next()
+                .flatMap(result -> geocodedAddressRepository.save(GeocodedAddress.builder()
+                                .normalizedAddress(normalizedAddress)
+                                .displayName(result.getDisplayName())
+                                .lat(result.getLat())
+                                .lon(result.getLon())
+                                .createdAt(LocalDateTime.now())
+                                .build())
+                        .map(this::toGeocodeResponse)
+                        .onErrorResume(error -> findCachedAddress(normalizedAddress)
+                                .map(this::toGeocodeResponse)
+                                .switchIfEmpty(Mono.just(result))))
                 .switchIfEmpty(Mono.error(new IllegalArgumentException("Could not geocode address: " + query)));
+    }
+
+    private GeocodeResponse toGeocodeResponse(GeocodedAddress address) {
+        return GeocodeResponse.builder()
+                .displayName(address.getDisplayName())
+                .lat(address.getLat())
+                .lon(address.getLon())
+                .build();
+    }
+
+    private String normalizeAddress(String query) {
+        return query == null ? "" : query.trim().replaceAll("\\s+", " ").toLowerCase(Locale.ENGLISH);
     }
 
     private String displayName(GoogleGeocodingResponse.GoogleGeocodingResult result) {

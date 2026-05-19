@@ -18,5 +18,6 @@ public class WorkerMileageUpload {
     @Id
     private Long id;
     private String fileName;
+    private String fileHash;
     private LocalDateTime createdAt;
 }

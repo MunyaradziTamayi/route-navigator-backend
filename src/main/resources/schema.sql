@@ -15,6 +15,18 @@ CREATE TABLE IF NOT EXISTS routes (
 CREATE INDEX IF NOT EXISTS idx_routes_coordinates
     ON routes (origin_lat, origin_lon, destination_lat, destination_lon, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS geocoded_addresses (
+    id                 BIGSERIAL PRIMARY KEY,
+    normalized_address VARCHAR(1000) NOT NULL,
+    display_name       VARCHAR(1000),
+    lat                DOUBLE PRECISION NOT NULL,
+    lon                DOUBLE PRECISION NOT NULL,
+    created_at         TIMESTAMP DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_geocoded_addresses_normalized_address
+    ON geocoded_addresses (normalized_address);
+
 CREATE TABLE IF NOT EXISTS visits (
     id                BIGSERIAL PRIMARY KEY,
     origin_label      VARCHAR(500),
@@ -64,8 +76,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_workers_staff_number
 CREATE TABLE IF NOT EXISTS worker_mileage_uploads (
     id             BIGSERIAL PRIMARY KEY,
     file_name      VARCHAR(255) NOT NULL,
+    file_hash      VARCHAR(64),
     created_at     TIMESTAMP DEFAULT NOW()
 );
+
+ALTER TABLE worker_mileage_uploads ADD COLUMN IF NOT EXISTS file_hash VARCHAR(64);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_mileage_uploads_file_hash
+    ON worker_mileage_uploads (file_hash)
+    WHERE file_hash IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS worker_mileage_reports (
     id             BIGSERIAL PRIMARY KEY,

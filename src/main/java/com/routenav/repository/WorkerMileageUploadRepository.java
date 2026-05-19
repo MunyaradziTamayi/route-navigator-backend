@@ -5,6 +5,7 @@ import java.time.LocalDateTime;
 import org.springframework.data.repository.reactive.ReactiveCrudRepository;
 import org.springframework.stereotype.Repository;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 @Repository
 public interface WorkerMileageUploadRepository extends ReactiveCrudRepository<WorkerMileageUpload, Long> {
@@ -12,4 +13,6 @@ public interface WorkerMileageUploadRepository extends ReactiveCrudRepository<Wo
     Flux<WorkerMileageUpload> findAllByOrderByCreatedAtDesc();
 
     Flux<WorkerMileageUpload> findByCreatedAtBetweenOrderByCreatedAtDesc(LocalDateTime start, LocalDateTime end);
+
+    Mono<WorkerMileageUpload> findFirstByFileHashOrderByCreatedAtDesc(String fileHash);
 }
