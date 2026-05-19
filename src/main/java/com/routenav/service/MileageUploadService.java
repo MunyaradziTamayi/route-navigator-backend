@@ -31,6 +31,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.TreeMap;
 import org.apache.poi.ss.usermodel.Cell;
@@ -485,12 +486,21 @@ public class MileageUploadService {
     private Mono<MileageResult> calculateStaffMileage(String staffNumber, List<VisitRow> visits) {
         visits.sort(Comparator.comparing(VisitRow::visitDateTime));
 
-        List<Location> locations = visits.stream()
-                .filter(visit -> visit.lat() != null && visit.lon() != null)
-                .map(visit -> new Location(visit.lat(), visit.lon()))
-                .toList();
+        Map<LocalDate, List<Location>> locationsByDay = new LinkedHashMap<>();
+        for (VisitRow visit : visits) {
+            if (visit.lat() != null && visit.lon() != null) {
+                locationsByDay.computeIfAbsent(visit.visitDate(), ignored -> new ArrayList<>())
+                        .add(new Location(visit.lat(), visit.lon()));
+            }
+        }
 
-        return calculateLocationDistances(staffNumber, locations);
+        return Flux.fromIterable(locationsByDay.values())
+                .concatMap(locations -> calculateLocationDistances(staffNumber, locations))
+                .reduce(new MileageResult(staffNumber, 0.0, 0.0),
+                        (total, day) -> new MileageResult(
+                                staffNumber,
+                                total.totalMileageKm() + day.totalMileageKm(),
+                                total.totalStraightLineMileageKm() + day.totalStraightLineMileageKm()));
     }
 
     private Mono<Location> geocode(VisitRow visit, Map<String, Mono<Location>> addressCache) {
@@ -530,13 +540,18 @@ public class MileageUploadService {
 
         Map<String, Double> totals = new HashMap<>();
         for (Map.Entry<String, List<WorkerMileageVisit>> entry : visitsByStaff.entrySet()) {
-            List<Location> locations = entry.getValue().stream()
+            Map<LocalDate, List<Location>> locationsByDay = new LinkedHashMap<>();
+            entry.getValue().stream()
                     .sorted(Comparator.comparing(WorkerMileageVisit::getVisitDate)
                             .thenComparing(WorkerMileageVisit::getStartTime, Comparator.nullsLast(Comparator.naturalOrder())))
                     .filter(visit -> visit.getLat() != null && visit.getLon() != null)
-                    .map(visit -> new Location(visit.getLat(), visit.getLon()))
-                    .toList();
-            totals.put(entry.getKey(), totalStraightLineMileageKm(locations));
+                    .forEach(visit -> locationsByDay.computeIfAbsent(visit.getVisitDate(), ignored -> new ArrayList<>())
+                            .add(new Location(visit.getLat(), visit.getLon())));
+
+            double total = locationsByDay.values().stream()
+                    .mapToDouble(this::totalStraightLineMileageKm)
+                    .sum();
+            totals.put(entry.getKey(), total);
         }
         return totals;
     }
@@ -864,6 +879,11 @@ public class MileageUploadService {
                     }
 
                     WorkerMileageVisit previous = visits.get(index - 1);
+                    if (!Objects.equals(current.getVisitDate(), previous.getVisitDate())) {
+                        cumulativeMileage[0] = 0.0;
+                        return Mono.just(toVisitResponse(current, null, 0.0, 0.0));
+                    }
+
                     return distanceBetween(previous, current)
                             .map(distance -> {
                                 double roundedDistance = roundMileage(distance);

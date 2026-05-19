@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Mileage Upload and Route Calculation Flow</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      line-height: 1.5;
+      color: #1f2933;
+      max-width: 850px;
+      margin: 32px auto;
+    }
+    h1, h2 {
+      color: #102a43;
+    }
+    h1 {
+      border-bottom: 2px solid #bcccdc;
+      padding-bottom: 10px;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 16px 0;
+    }
+    th, td {
+      border: 1px solid #bcccdc;
+      padding: 8px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: #f0f4f8;
+    }
+    code, pre {
+      font-family: Consolas, monospace;
+      background: #f0f4f8;
+    }
+    code {
+      padding: 2px 4px;
+    }
+    pre {
+      padding: 12px;
+      white-space: pre-wrap;
+      border-left: 4px solid #486581;
+    }
+  </style>
+</head>
+<body>
+  <h1>Mileage Upload and Route Calculation Flow</h1>
+
+  <h2>Purpose</h2>
+  <p>This document explains how the mileage upload feature works in the Route Navigator backend. It follows the process from the moment a user uploads an Excel file, through address geocoding, route distance calculation with the Google Routes API, and final report generation.</p>
+
+  <h2>Main Files Involved</h2>
+  <table>
+    <tr><th>File</th><th>Responsibility</th></tr>
+    <tr><td><code>src/main/java/com/routenav/controller/MileageUploadController.java</code></td><td>Receives the uploaded Excel file through the API.</td></tr>
+    <tr><td><code>src/main/java/com/routenav/service/MileageUploadService.java</code></td><td>Parses the Excel file, groups visits, geocodes addresses, calculates mileage, saves reports, and creates result files.</td></tr>
+    <tr><td><code>src/main/java/com/routenav/service/GeocodingService.java</code></td><td>Converts an address into latitude and longitude coordinates.</td></tr>
+    <tr><td><code>src/main/java/com/routenav/service/RoutingService.java</code></td><td>Calls the Google Routes API to calculate driving distance between two coordinates.</td></tr>
+    <tr><td><code>src/main/java/com/routenav/repository/*</code></td><td>Saves uploads, reports, report rows, visits, and cached routes in the database.</td></tr>
+  </table>
+
+  <h2>High-Level Flow</h2>
+  <pre>User uploads Excel file
+        |
+        v
+MileageUploadController receives the file
+        |
+        v
+MileageUploadService reads and parses the Excel rows
+        |
+        v
+Rows are grouped by report month
+        |
+        v
+Each address is geocoded into latitude and longitude
+        |
+        v
+Visits are grouped by staff number
+        |
+        v
+Each staff member's visits are sorted by date and time
+        |
+        v
+Distances are calculated between consecutive visits
+        |
+        v
+Google Routes API returns driving distances
+        |
+        v
+Distances are added together per staff member
+        |
+        v
+Reports, visits, totals, and generated Excel report are saved</pre>
+
+  <h2>Step 1: User Uploads Excel File</h2>
+  <p>The upload starts when the frontend sends a multipart file request to:</p>
+  <pre>POST /api/mileage/upload</pre>
+  <p>This endpoint is handled in <code>MileageUploadController.java</code>.</p>
+  <p>The important method is:</p>
+  <pre>@PostMapping(value = "/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+public Mono&lt;ResponseEntity&lt;Object&gt;&gt; upload(@RequestPart("file") FilePart file)</pre>
+  <p>The controller does not calculate the mileage itself. It passes the uploaded file to:</p>
+  <pre>mileageUploadService.calculateMonthlyMileageUpload(file)</pre>
+
+  <h2>Step 2: Upload Record Is Saved</h2>
+  <p>Inside <code>MileageUploadService</code>, the method <code>calculateMonthlyMileageUpload(FilePart file)</code> first saves a record of the uploaded file. This allows the system to keep track of uploads and list them later.</p>
+  <p>After saving the upload, it calls <code>calculateMonthlyMileageReports(file, upload.getId())</code>. This starts the actual report calculation.</p>
+
+  <h2>Step 3: Excel File Is Read Into Memory</h2>
+  <p>The service reads the uploaded Excel file content using:</p>
+  <pre>DataBufferUtils.join(file.content())</pre>
+  <p>The file content is converted into bytes, then passed into <code>parseVisits(bytes)</code>.</p>
+  <p>The Excel parsing uses Apache POI:</p>
+  <pre>Workbook workbook = new XSSFWorkbook(new ByteArrayInputStream(bytes))</pre>
+
+  <h2>Step 4: Excel Rows Are Parsed Into Visits</h2>
+  <p>The parsing logic is in <code>MileageUploadService.java</code>, method <code>parseVisits(byte[] bytes)</code>.</p>
+  <p>The system reads the first sheet of the workbook and expects the first row to contain the column headers.</p>
+  <p>The required Excel columns are:</p>
+  <pre>staff number
+date
+visit time
+address</pre>
+  <p>If any of these columns are missing, the upload fails with an error.</p>
+  <p>Each non-empty row is converted into a <code>VisitRow</code> containing staff number, visit date, start time, end time, address, latitude, and longitude. At this stage, latitude and longitude are still empty because the system has only read the address text from Excel.</p>
+
+  <h2>Step 5: Visits Are Grouped By Month</h2>
+  <p>After parsing the Excel file, the system groups visits by month using each visit's date. The method responsible is <code>groupVisitsByMonth(List&lt;VisitRow&gt; visits)</code>.</p>
+  <p>This means one uploaded Excel file can produce more than one monthly report.</p>
+  <pre>Rows from January 2026 -> January 2026 report
+Rows from February 2026 -> February 2026 report
+Rows from March 2026 -> March 2026 report</pre>
+
+  <h2>Step 6: Addresses Are Converted To Coordinates</h2>
+  <p>Before the system can calculate driving distance, it must convert each address into coordinates. This is called geocoding.</p>
+  <p>The method is <code>geocodeVisits(List&lt;VisitRow&gt; visits)</code>. For each visit address, the service calls:</p>
+  <pre>geocodingService.geocodeFirst(address)</pre>
+  <p>The result is a latitude and longitude pair.</p>
+  <pre>"123 Main Street" -> latitude: -17.8216, longitude: 31.0492</pre>
+  <p>The service also caches repeated addresses during the upload using a map. This means if the same address appears many times in the same upload, the system only geocodes it once and reuses the result.</p>
+
+  <h2>Step 7: Visits Are Grouped By Staff Number</h2>
+  <p>Once every visit has coordinates, the system groups visits by staff number. The method is <code>calculateMileage(List&lt;VisitRow&gt; visits)</code>.</p>
+  <pre>Staff 1001 -> all visits for staff 1001
+Staff 1002 -> all visits for staff 1002
+Staff 1003 -> all visits for staff 1003</pre>
+  <p>Each staff member's mileage is calculated separately.</p>
+
+  <h2>Step 8: Each Staff Member's Visits Are Sorted By Time</h2>
+  <p>For each staff member, the visits are sorted by visit date and start time:</p>
+  <pre>visits.sort(Comparator.comparing(VisitRow::visitDateTime));</pre>
+  <p>This is important because mileage depends on the order of travel.</p>
+  <pre>08:00 - Address A
+10:00 - Address B
+13:00 - Address C</pre>
+  <p>The system assumes the worker traveled from Address A to Address B to Address C.</p>
+
+  <h2>Step 9: Each Day Starts Fresh</h2>
+  <p>After sorting the visits, the system separates each staff member's visits by day.</p>
+  <p>This prevents the system from calculating a route from the last visit of one day to the first visit of the next day.</p>
+  <p>Example:</p>
+  <pre>Monday:
+08:00 - Address A
+10:00 - Address B
+
+Tuesday:
+09:00 - Address C
+11:00 - Address D</pre>
+  <p>The mileage is calculated like this:</p>
+  <pre>Monday mileage = distance(Address A -> Address B)
+Tuesday mileage = distance(Address C -> Address D)</pre>
+  <p>It is not calculated like this:</p>
+  <pre>Address A -> Address B -> Address C -> Address D</pre>
+  <p>So when a new day starts, the first address of that day becomes the starting point for that day.</p>
+
+  <h2>Step 10: Consecutive Visit Pairs Are Created</h2>
+  <p>After sorting, the system creates pairs of consecutive locations. The method is <code>calculateLocationDistances(String staffNumber, List&lt;Location&gt; locations)</code>.</p>
+  <pre>Visit 1 -> Visit 2
+Visit 2 -> Visit 3
+Visit 3 -> Visit 4</pre>
+  <p>If a staff member has fewer than two valid locations, their mileage is <code>0.0</code> because there is no travel leg to calculate.</p>
+
+  <h2>Step 11: Google Routes API Calculates Driving Distance</h2>
+  <p>For each pair of locations, the system calls <code>routingService.calculateDistanceKm(...)</code>. This method is in <code>RoutingService.java</code>.</p>
+  <p>The <code>RoutingService</code> first checks if the same origin and destination route has already been saved in the database. If a saved route exists, the system reuses the stored distance.</p>
+  <p>If no saved route exists, the system calls the Google Routes API endpoint:</p>
+  <pre>/directions/v2:computeRoutes</pre>
+  <p>The request uses:</p>
+  <pre>travelMode: DRIVE
+routingPreference: TRAFFIC_UNAWARE
+computeAlternativeRoutes: true</pre>
+  <p>Google may return more than one possible route. The backend chooses the shortest returned route by distance.</p>
+  <p>The returned distance is in meters, so the backend converts it to kilometers:</p>
+  <pre>distanceMeters / 1000.0</pre>
+  <p>The distance is then saved in the database so future calculations for the same coordinate pair can reuse it.</p>
+
+  <h2>Step 12: Distances Are Added Together</h2>
+  <p>After Google returns the distance for each route pair, the system adds them together:</p>
+  <pre>.reduce(0.0, Double::sum)</pre>
+  <p>Example:</p>
+  <pre>Staff 1001:
+
+Address A -> Address B = 4.5 km
+Address B -> Address C = 7.2 km
+Address C -> Address D = 3.1 km
+
+Total mileage = 14.8 km</pre>
+  <p>This total becomes the staff member's driving mileage for that report month.</p>
+  <p>If a report covers multiple days in the same month, the monthly total is the sum of each day's mileage.</p>
+
+  <h2>Step 13: Straight-Line Mileage Is Also Calculated</h2>
+  <p>The system also calculates straight-line distance between coordinates. This is not the final driving mileage, but it is useful for comparison.</p>
+  <p>Straight-line distance uses the Haversine formula, which estimates direct distance across the earth's surface.</p>
+  <p>Driving mileage comes from Google Routes API. Straight-line mileage comes from local mathematical calculation.</p>
+  <p>Straight-line mileage is also calculated per day, so it does not connect the last visit of one day to the first visit of the next day.</p>
+
+  <h2>Step 14: Report Data Is Saved</h2>
+  <p>After mileage is calculated, the system saves the upload record, monthly report, staff mileage rows, individual visit rows, and generated Excel report file.</p>
+  <p>The report rows contain each staff member's total mileage. The visit rows contain the original visit information plus the geocoded coordinates.</p>
+
+  <h2>Step 15: A Result Excel File Is Generated</h2>
+  <p>The service creates a new Excel workbook using <code>buildWorkbook(results)</code>.</p>
+  <p>The generated workbook contains:</p>
+  <pre>Staff Number
+Driving Mileage</pre>
+  <p>This file is saved with the report and can later be downloaded from:</p>
+  <pre>GET /api/mileage/reports/{id}/download</pre>
+
+  <h2>Simple Example</h2>
+  <table>
+    <tr><th>Staff Number</th><th>Date</th><th>Visit Time</th><th>Address</th></tr>
+    <tr><td>101</td><td>2026-05-01</td><td>08:00</td><td>Address A</td></tr>
+    <tr><td>101</td><td>2026-05-01</td><td>10:00</td><td>Address B</td></tr>
+    <tr><td>101</td><td>2026-05-01</td><td>13:00</td><td>Address C</td></tr>
+    <tr><td>101</td><td>2026-05-02</td><td>09:00</td><td>Address D</td></tr>
+    <tr><td>101</td><td>2026-05-02</td><td>11:00</td><td>Address E</td></tr>
+  </table>
+  <p>The system groups by staff and by day:</p>
+  <pre>Staff 101:
+2026-05-01:
+Address A -> Address B -> Address C
+
+2026-05-02:
+Address D -> Address E</pre>
+  <p>Then it calculates:</p>
+  <pre>Staff 101 mileage =
+  distance(A to B)
+  + distance(B to C)
+  + distance(D to E)</pre>
+  <p>Each distance is a driving distance from the Google Routes API.</p>
+  <p>There is no distance calculated from Address C on 2026-05-01 to Address D on 2026-05-02.</p>
+
+  <h2>Important Notes</h2>
+  <p>The system calculates mileage between visits only.</p>
+  <p>Each day starts fresh. The system does not connect the previous day's last visit to the next day's first visit.</p>
+  <p>It does not automatically include travel from home to the first visit or from the last visit back home unless those addresses are included as rows in the Excel file.</p>
+  <p>The order of visits matters. If the visit times are wrong, the mileage route order will also be wrong.</p>
+  <p>The uploaded Excel headers must match the required names: <code>staff number</code>, <code>date</code>, <code>visit time</code>, and <code>address</code>.</p>
+  <p>Repeated addresses are cached during the upload to reduce duplicate geocoding calls.</p>
+  <p>Route distances are cached in the database so repeated coordinate pairs do not always require another Google Routes API call.</p>
+
+  <h2>Summary</h2>
+  <p>The mileage upload feature works by turning Excel visit rows into ordered travel legs for each staff member. Addresses are converted into coordinates, consecutive visits are sent to Google Routes API for driving distance, and the returned distances are summed into monthly staff mileage totals.</p>
+  <pre>Excel rows -> visits -> coordinates -> ordered staff routes -> Google driving distances -> monthly mileage report</pre>
+</body>
+</html>
