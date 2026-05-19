@@ -131,9 +131,10 @@ public class MileageUploadService {
 
     public Flux<WorkerMileageTotalResponse> getMileageTotals(String reportMonth, Integer year) {
         return findReports(reportMonth, year)
-                .flatMap(report -> reportRowRepository.findByReportIdOrderByStaffNumberAsc(report.getId())
-                        .collectList()
-                        .map(rows -> new ReportRows(report, rows)))
+                .flatMap(report -> Mono.zip(
+                                reportRowRepository.findByReportIdOrderByStaffNumberAsc(report.getId()).collectList(),
+                                visitRepository.findByReportIdOrderByStaffNumberAscVisitDateAscStartTimeAsc(report.getId()).collectList())
+                        .map(tuple -> new ReportRows(report, tuple.getT1(), tuple.getT2())))
                 .collectList()
                 .flatMapMany(reportRows -> {
                     if (reportRows.isEmpty()) {
@@ -605,21 +606,28 @@ public class MileageUploadService {
     }
 
     private WorkerMileageTotalResponse toUploadedMileageTotalResponse(String reportMonth, String label, List<WorkerMileageReportResponse> reports) {
-        Map<String, Double> totalsByStaff = new TreeMap<>();
+        Map<String, StaffMileageTotals> totalsByStaff = new TreeMap<>();
         double totalMileageKm = 0.0;
+        double totalStraightLineMileageKm = 0.0;
 
         for (WorkerMileageReportResponse report : reports) {
             for (WorkerMileageReportRowResponse row : report.getRows()) {
                 double rowMileageKm = rowMileageKm(row);
+                double rowStraightLineMileageKm = rowStraightLineMileageKm(row);
                 totalMileageKm += rowMileageKm;
-                totalsByStaff.merge(row.getStaffNumber(), rowMileageKm, Double::sum);
+                totalStraightLineMileageKm += rowStraightLineMileageKm;
+                totalsByStaff.computeIfAbsent(row.getStaffNumber(), ignored -> new StaffMileageTotals())
+                        .add(rowMileageKm, rowStraightLineMileageKm);
             }
         }
 
         List<WorkerMileageTotalRowResponse> rows = totalsByStaff.entrySet().stream()
                 .map(entry -> WorkerMileageTotalRowResponse.builder()
                         .staffNumber(entry.getKey())
-                        .totalMileageMiles(kmToMiles(entry.getValue()))
+                        .totalMileageMiles(kmToMiles(entry.getValue().totalMileage()))
+                        .totalStraightLineMileage(roundMileage(entry.getValue().totalStraightLineMileage()))
+                        .totalStraightLineMileageKm(roundMileage(entry.getValue().totalStraightLineMileage()))
+                        .totalStraightLineMileageMiles(kmToMiles(entry.getValue().totalStraightLineMileage()))
                         .build())
                 .toList();
 
@@ -628,6 +636,7 @@ public class MileageUploadService {
                 .uploadId(uploadIdFromReportResponses(reports))
                 .label(label)
                 .totalMileageMiles(kmToMiles(totalMileageKm))
+                .totalStraightLineMileageMiles(kmToMiles(totalStraightLineMileageKm))
                 .reportCount(reports.size())
                 .rows(rows)
                 .build();
@@ -638,6 +647,13 @@ public class MileageUploadService {
             return row.getTotalMileageKm();
         }
         return row.getTotalMileage() == null ? 0.0 : row.getTotalMileage();
+    }
+
+    private double rowStraightLineMileageKm(WorkerMileageReportRowResponse row) {
+        if (row.getTotalStraightLineMileageKm() != null) {
+            return row.getTotalStraightLineMileageKm();
+        }
+        return row.getTotalStraightLineMileage() == null ? 0.0 : row.getTotalStraightLineMileage();
     }
 
     private Long uploadIdFromReportResponses(List<WorkerMileageReportResponse> reports) {
@@ -671,14 +687,21 @@ public class MileageUploadService {
     private WorkerMileageTotalResponse toStoredMileageTotalResponse(String reportMonth, String label, List<ReportRows> reports) {
         Map<String, StaffMileageTotals> totalsByStaff = new TreeMap<>();
         double totalMileage = 0.0;
+        double totalStraightLineMileage = 0.0;
 
         for (ReportRows report : reports) {
+            Map<String, Double> straightLineMileageByStaff = straightLineMileageByStaff(report.visits());
             for (WorkerMileageReportRow row : report.rows()) {
                 double rowMileage = row.getTotalMileage() == null ? 0.0 : row.getTotalMileage();
+                double storedStraightLineMileage = row.getTotalStraightLineMileage() == null ? 0.0 : row.getTotalStraightLineMileage();
+                double rowStraightLineMileage = storedStraightLineMileage > 0.0
+                        ? storedStraightLineMileage
+                        : straightLineMileageByStaff.getOrDefault(row.getStaffNumber(), 0.0);
                 totalMileage += rowMileage;
+                totalStraightLineMileage += rowStraightLineMileage;
 
                 totalsByStaff.computeIfAbsent(row.getStaffNumber(), ignored -> new StaffMileageTotals())
-                        .add(rowMileage, 0.0);
+                        .add(rowMileage, rowStraightLineMileage);
             }
         }
 
@@ -686,6 +709,9 @@ public class MileageUploadService {
                 .map(entry -> WorkerMileageTotalRowResponse.builder()
                         .staffNumber(entry.getKey())
                         .totalMileageMiles(kmToMiles(entry.getValue().totalMileage()))
+                        .totalStraightLineMileage(roundMileage(entry.getValue().totalStraightLineMileage()))
+                        .totalStraightLineMileageKm(roundMileage(entry.getValue().totalStraightLineMileage()))
+                        .totalStraightLineMileageMiles(kmToMiles(entry.getValue().totalStraightLineMileage()))
                         .build())
                 .toList();
 
@@ -694,6 +720,7 @@ public class MileageUploadService {
                 .uploadId(uploadIdFromReportRows(reports))
                 .label(label)
                 .totalMileageMiles(kmToMiles(totalMileage))
+                .totalStraightLineMileageMiles(kmToMiles(totalStraightLineMileage))
                 .reportCount(reports.size())
                 .rows(rows)
                 .build();
@@ -790,6 +817,7 @@ public class MileageUploadService {
                         .reportId(reportId)
                         .staffNumber(result.staffNumber())
                         .totalMileage(roundMileage(result.totalMileageKm()))
+                        .totalStraightLineMileage(roundMileage(result.totalStraightLineMileageKm()))
                         .build())
                 .flatMap(reportRowRepository::save)
                 .then();
@@ -957,7 +985,7 @@ public class MileageUploadService {
     private record ParsedMonthYear(int month, int year) {
     }
 
-    private record ReportRows(WorkerMileageReport report, List<WorkerMileageReportRow> rows) {
+    private record ReportRows(WorkerMileageReport report, List<WorkerMileageReportRow> rows, List<WorkerMileageVisit> visits) {
     }
 
     private static class StaffMileageTotals {

@@ -16,6 +16,7 @@ public class WorkerMileageTotalResponse {
     private Long uploadId;
     private String label;
     private Double totalMileageMiles;
+    private Double totalStraightLineMileageMiles;
     private Integer reportCount;
     private List<WorkerMileageTotalRowResponse> rows;
 }

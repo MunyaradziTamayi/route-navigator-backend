@@ -82,8 +82,11 @@ CREATE TABLE IF NOT EXISTS worker_mileage_report_rows (
     id              BIGSERIAL PRIMARY KEY,
     report_id       BIGINT NOT NULL REFERENCES worker_mileage_reports(id) ON DELETE CASCADE,
     staff_number    VARCHAR(100) NOT NULL,
-    total_mileage   DOUBLE PRECISION NOT NULL
+    total_mileage   DOUBLE PRECISION NOT NULL,
+    total_straight_line_mileage DOUBLE PRECISION NOT NULL DEFAULT 0
 );
+
+ALTER TABLE worker_mileage_report_rows ADD COLUMN IF NOT EXISTS total_straight_line_mileage DOUBLE PRECISION NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS worker_mileage_visits (
     id              BIGSERIAL PRIMARY KEY,

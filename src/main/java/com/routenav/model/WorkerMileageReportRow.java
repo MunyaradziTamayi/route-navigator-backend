@@ -19,4 +19,5 @@ public class WorkerMileageReportRow {
     private Long reportId;
     private String staffNumber;
     private Double totalMileage;
+    private Double totalStraightLineMileage;
 }
