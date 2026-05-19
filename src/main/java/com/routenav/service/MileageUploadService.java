@@ -741,17 +741,20 @@ public class MileageUploadService {
             Sheet sheet = workbook.createSheet("Mileage Results");
             Row header = sheet.createRow(0);
             header.createCell(0).setCellValue("Staff Number");
-            header.createCell(1).setCellValue("Driving Mileage");
+            header.createCell(1).setCellValue("Driving Mileage (miles)");
+            header.createCell(2).setCellValue("Straight-line Mileage (miles)");
 
             for (int i = 0; i < results.size(); i++) {
                 MileageResult result = results.get(i);
                 Row row = sheet.createRow(i + 1);
                 row.createCell(0).setCellValue(result.staffNumber());
                 row.createCell(1).setCellValue(kmToMiles(result.totalMileageKm()));
+                row.createCell(2).setCellValue(kmToMiles(result.totalStraightLineMileageKm()));
             }
 
             sheet.autoSizeColumn(0);
             sheet.autoSizeColumn(1);
+            sheet.autoSizeColumn(2);
             workbook.write(outputStream);
             return outputStream.toByteArray();
         }
@@ -762,17 +765,20 @@ public class MileageUploadService {
             Sheet sheet = workbook.createSheet("Mileage Results");
             Row header = sheet.createRow(0);
             header.createCell(0).setCellValue("Staff Number");
-            header.createCell(1).setCellValue("Driving Mileage");
+            header.createCell(1).setCellValue("Driving Mileage (miles)");
+            header.createCell(2).setCellValue("Straight-line Mileage (miles)");
 
             for (int i = 0; i < rows.size(); i++) {
                 WorkerMileageReportRow result = rows.get(i);
                 Row row = sheet.createRow(i + 1);
                 row.createCell(0).setCellValue(result.getStaffNumber());
                 row.createCell(1).setCellValue(kmToMiles(result.getTotalMileage() == null ? 0.0 : result.getTotalMileage()));
+                row.createCell(2).setCellValue(kmToMiles(result.getTotalStraightLineMileage() == null ? 0.0 : result.getTotalStraightLineMileage()));
             }
 
             sheet.autoSizeColumn(0);
             sheet.autoSizeColumn(1);
+            sheet.autoSizeColumn(2);
             workbook.write(outputStream);
             return outputStream.toByteArray();
         }
