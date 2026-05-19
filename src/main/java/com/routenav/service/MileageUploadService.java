@@ -207,8 +207,10 @@ public class MileageUploadService {
         return reportRepository.findById(reportId)
                 .flatMap(report -> reportRowRepository.findByReportIdOrderByStaffNumberAsc(reportId)
                         .collectList()
-                        .flatMap(rows -> Mono.fromCallable(() -> {
-                            report.setFileContent(buildWorkbookFromRows(rows));
+                        .zipWith(visitRepository.findByReportIdOrderByStaffNumberAscVisitDateAscStartTimeAsc(reportId)
+                                .collectList())
+                        .flatMap(tuple -> Mono.fromCallable(() -> {
+                            report.setFileContent(buildWorkbookFromRows(tuple.getT1(), straightLineMileageByStaff(tuple.getT2())));
                             return report;
                         }).subscribeOn(Schedulers.boundedElastic())));
     }
@@ -694,9 +696,9 @@ public class MileageUploadService {
             for (WorkerMileageReportRow row : report.rows()) {
                 double rowMileage = row.getTotalMileage() == null ? 0.0 : row.getTotalMileage();
                 double storedStraightLineMileage = row.getTotalStraightLineMileage() == null ? 0.0 : row.getTotalStraightLineMileage();
-                double rowStraightLineMileage = storedStraightLineMileage > 0.0
-                        ? storedStraightLineMileage
-                        : straightLineMileageByStaff.getOrDefault(row.getStaffNumber(), 0.0);
+                double rowStraightLineMileage = straightLineMileageByStaff.containsKey(row.getStaffNumber())
+                        ? straightLineMileageByStaff.get(row.getStaffNumber())
+                        : storedStraightLineMileage;
                 totalMileage += rowMileage;
                 totalStraightLineMileage += rowStraightLineMileage;
 
@@ -760,7 +762,7 @@ public class MileageUploadService {
         }
     }
 
-    private byte[] buildWorkbookFromRows(List<WorkerMileageReportRow> rows) throws IOException {
+    private byte[] buildWorkbookFromRows(List<WorkerMileageReportRow> rows, Map<String, Double> straightLineMileageByStaff) throws IOException {
         try (Workbook workbook = new XSSFWorkbook(); ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
             Sheet sheet = workbook.createSheet("Mileage Results");
             Row header = sheet.createRow(0);
@@ -773,7 +775,10 @@ public class MileageUploadService {
                 Row row = sheet.createRow(i + 1);
                 row.createCell(0).setCellValue(result.getStaffNumber());
                 row.createCell(1).setCellValue(kmToMiles(result.getTotalMileage() == null ? 0.0 : result.getTotalMileage()));
-                row.createCell(2).setCellValue(kmToMiles(result.getTotalStraightLineMileage() == null ? 0.0 : result.getTotalStraightLineMileage()));
+                double straightLineMileageKm = straightLineMileageByStaff.containsKey(result.getStaffNumber())
+                        ? straightLineMileageByStaff.get(result.getStaffNumber())
+                        : result.getTotalStraightLineMileage() == null ? 0.0 : result.getTotalStraightLineMileage();
+                row.createCell(2).setCellValue(kmToMiles(straightLineMileageKm));
             }
 
             sheet.autoSizeColumn(0);
