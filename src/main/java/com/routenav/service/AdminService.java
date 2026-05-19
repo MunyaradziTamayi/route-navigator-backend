@@ -15,8 +15,7 @@ public class AdminService {
             "DELETE FROM worker_mileage_reports",
             "DELETE FROM worker_mileage_uploads",
             "DELETE FROM visits",
-            "DELETE FROM workers",
-            "DELETE FROM routes"
+            "DELETE FROM workers"
     );
 
     private final DatabaseClient databaseClient;
