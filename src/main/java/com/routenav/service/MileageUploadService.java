@@ -230,7 +230,7 @@ public class MileageUploadService {
                         .zipWith(visitRepository.findByReportIdOrderByStaffNumberAscVisitDateAscStartTimeAsc(reportId)
                                 .collectList())
                         .flatMap(tuple -> Mono.fromCallable(() -> {
-                            report.setFileContent(buildWorkbookFromRows(tuple.getT1(), straightLineMileageByStaff(tuple.getT2())));
+                            report.setFileContent(buildWorkbookFromRows(tuple.getT1()));
                             return report;
                         }).subscribeOn(Schedulers.boundedElastic())));
     }
@@ -795,46 +795,37 @@ public class MileageUploadService {
             Row header = sheet.createRow(0);
             header.createCell(0).setCellValue("Staff Number");
             header.createCell(1).setCellValue("Driving Mileage (miles)");
-            header.createCell(2).setCellValue("Straight-line Mileage (miles)");
 
             for (int i = 0; i < results.size(); i++) {
                 MileageResult result = results.get(i);
                 Row row = sheet.createRow(i + 1);
                 row.createCell(0).setCellValue(result.staffNumber());
                 row.createCell(1).setCellValue(kmToMiles(result.totalMileageKm()));
-                row.createCell(2).setCellValue(kmToMiles(result.totalStraightLineMileageKm()));
             }
 
             sheet.autoSizeColumn(0);
             sheet.autoSizeColumn(1);
-            sheet.autoSizeColumn(2);
             workbook.write(outputStream);
             return outputStream.toByteArray();
         }
     }
 
-    private byte[] buildWorkbookFromRows(List<WorkerMileageReportRow> rows, Map<String, Double> straightLineMileageByStaff) throws IOException {
+    private byte[] buildWorkbookFromRows(List<WorkerMileageReportRow> rows) throws IOException {
         try (Workbook workbook = new XSSFWorkbook(); ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
             Sheet sheet = workbook.createSheet("Mileage Results");
             Row header = sheet.createRow(0);
             header.createCell(0).setCellValue("Staff Number");
             header.createCell(1).setCellValue("Driving Mileage (miles)");
-            header.createCell(2).setCellValue("Straight-line Mileage (miles)");
 
             for (int i = 0; i < rows.size(); i++) {
                 WorkerMileageReportRow result = rows.get(i);
                 Row row = sheet.createRow(i + 1);
                 row.createCell(0).setCellValue(result.getStaffNumber());
                 row.createCell(1).setCellValue(kmToMiles(result.getTotalMileage() == null ? 0.0 : result.getTotalMileage()));
-                double straightLineMileageKm = straightLineMileageByStaff.containsKey(result.getStaffNumber())
-                        ? straightLineMileageByStaff.get(result.getStaffNumber())
-                        : result.getTotalStraightLineMileage() == null ? 0.0 : result.getTotalStraightLineMileage();
-                row.createCell(2).setCellValue(kmToMiles(straightLineMileageKm));
             }
 
             sheet.autoSizeColumn(0);
             sheet.autoSizeColumn(1);
-            sheet.autoSizeColumn(2);
             workbook.write(outputStream);
             return outputStream.toByteArray();
         }
