@@ -1072,14 +1072,27 @@ public class MileageUploadService {
 
     private byte[] buildWorkbook(AnalysisResult analysis) throws IOException {
         try (Workbook workbook = new XSSFWorkbook(); ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
-            writeOptimisedScheduleSheet(workbook, analysis);
-            writeCarerTotalsSheet(workbook, analysis.rows());
-            writeDailyTotalsSheet(workbook, analysis.shifts());
-            writeShiftBreakdownSheet(workbook, analysis.shifts());
-            writeLegsSheet(workbook, analysis.shifts());
+            writeOptimisedMileageSheet(workbook, analysis.rows());
             workbook.write(outputStream);
             return outputStream.toByteArray();
         }
+    }
+
+    private void writeOptimisedMileageSheet(Workbook workbook, List<MileageResult> results) {
+        Sheet sheet = workbook.createSheet("Mileage Results");
+        Row header = sheet.createRow(0);
+        header.createCell(0).setCellValue("Staff Number");
+        header.createCell(1).setCellValue("Optimized Mileage (miles)");
+
+        for (int i = 0; i < results.size(); i++) {
+            MileageResult result = results.get(i);
+            Row row = sheet.createRow(i + 1);
+            row.createCell(0).setCellValue(result.staffNumber());
+            row.createCell(1).setCellValue(kmToMiles(result.totalMileageKm()));
+        }
+
+        sheet.autoSizeColumn(0);
+        sheet.autoSizeColumn(1);
     }
 
     private void writeOptimisedScheduleSheet(Workbook workbook, AnalysisResult analysis) {
