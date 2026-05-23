@@ -6,6 +6,7 @@ import com.routenav.dto.WorkerMileageTotalResponse;
 import com.routenav.dto.WorkerMileageTotalRowResponse;
 import com.routenav.dto.WorkerMileageUploadResponse;
 import com.routenav.dto.WorkerMileageVisitResponse;
+import com.routenav.dto.GoogleDistanceMatrixResponse;
 import com.routenav.model.WorkerMileageReport;
 import com.routenav.model.WorkerMileageReportRow;
 import com.routenav.model.WorkerMileageUpload;
@@ -48,6 +49,11 @@ import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.core.io.buffer.DataBufferUtils;
 import org.springframework.http.codec.multipart.FilePart;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatusCode;
+import org.springframework.util.StringUtils;
+import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -57,6 +63,21 @@ import reactor.core.scheduler.Schedulers;
 public class MileageUploadService {
 
     private static final double KM_TO_MILES = 0.621371;
+    private static final double METERS_PER_KM = 1000.0;
+    private static final int BRUTE_FORCE_LIMIT = 9;
+    private static final int BATCH_MAX_DIM = 25;
+    private static final int BATCH_MAX_ELEM = 100;
+
+    private static final Map<String, List<String>> COLUMN_ALIASES = Map.of(
+            "Carer_No", List.of("Carer_No", "Carer No", "CarerNo", "Carer Number", "Staff Number", "Staff No", "StaffNo", "Worker Number", "Worker No", "WorkerNo", "Employee No", "Employee Number"),
+            "Client Address", List.of("Client Address", "Client_Address", "ClientAddress", "Address", "Location", "Visit Address", "Client Location"),
+            "Date_of_Call", List.of("Date_of_Call", "Date of Call", "DateofCall", "Date", "Call Date", "Visit Date", "Service Date"),
+            "Time_of_Call", List.of("Time_of_Call", "Time of Call", "TimeofCall", "Time", "Visit Time", "Call Time", "Visit_Time"),
+            "Name", List.of("Name", "Client Name", "ClientName", "Client", "Patient Name", "Service User"),
+            "Shifts", List.of("Shifts", "Shift", "Call Type", "Period", "Run"),
+            "From Address", List.of("From Address", "From_Address", "FromAddress", "From", "Origin", "Start", "Start Address", "Pickup", "Pickup Address"),
+            "To Address", List.of("To Address", "To_Address", "ToAddress", "To", "Destination", "End", "End Address", "Dropoff", "Dropoff Address")
+    );
 
     private static final List<DateTimeFormatter> DATE_FORMATTERS = List.of(
             DateTimeFormatter.ISO_LOCAL_DATE,
@@ -85,18 +106,26 @@ public class MileageUploadService {
 
     private final WorkerMileageVisitRepository visitRepository;
 
+    private final WebClient googleMapsClient;
+
+    private final String googleApiKey;
+
     public MileageUploadService(GeocodingService geocodingService,
                                 RoutingService routingService,
                                 WorkerMileageReportRepository reportRepository,
                                 WorkerMileageReportRowRepository reportRowRepository,
                                 WorkerMileageUploadRepository uploadRepository,
-                                WorkerMileageVisitRepository visitRepository) {
+                                WorkerMileageVisitRepository visitRepository,
+                                @Qualifier("googleGeocodingClient") WebClient googleMapsClient,
+                                @Value("${google.api-key}") String googleApiKey) {
         this.geocodingService = geocodingService;
         this.routingService = routingService;
         this.reportRepository = reportRepository;
         this.reportRowRepository = reportRowRepository;
         this.uploadRepository = uploadRepository;
         this.visitRepository = visitRepository;
+        this.googleMapsClient = googleMapsClient;
+        this.googleApiKey = googleApiKey;
     }
 
     public Mono<List<WorkerMileageReportResponse>> calculateMonthlyMileageReports(FilePart file) {
@@ -109,11 +138,10 @@ public class MileageUploadService {
         return Mono.fromCallable(() -> parseVisits(bytes))
                 .subscribeOn(Schedulers.boundedElastic())
                 .flatMapMany(visits -> Flux.fromIterable(groupVisitsByMonth(visits).entrySet()))
-                .concatMap(entry -> geocodeVisits(entry.getValue())
-                        .flatMap(geocodedVisits -> calculateMileage(geocodedVisits)
-                                .flatMap(results -> Mono.fromCallable(() -> buildWorkbook(results))
-                                        .subscribeOn(Schedulers.boundedElastic())
-                                        .flatMap(workbook -> saveReport(uploadId, reportMonth(entry.getKey()), geocodedVisits, results, workbook)))))
+                .concatMap(entry -> calculateMileage(entry.getValue())
+                        .flatMap(analysis -> Mono.fromCallable(() -> buildWorkbook(analysis))
+                                .subscribeOn(Schedulers.boundedElastic())
+                                .flatMap(workbook -> saveReport(uploadId, reportMonth(entry.getKey()), entry.getValue(), analysis.rows(), workbook))))
                 .collectList();
     }
 
@@ -224,15 +252,7 @@ public class MileageUploadService {
     }
 
     public Mono<WorkerMileageReport> getReportFile(Long reportId) {
-        return reportRepository.findById(reportId)
-                .flatMap(report -> reportRowRepository.findByReportIdOrderByStaffNumberAsc(reportId)
-                        .collectList()
-                        .zipWith(visitRepository.findByReportIdOrderByStaffNumberAscVisitDateAscStartTimeAsc(reportId)
-                                .collectList())
-                        .flatMap(tuple -> Mono.fromCallable(() -> {
-                            report.setFileContent(buildWorkbookFromRows(tuple.getT1()));
-                            return report;
-                        }).subscribeOn(Schedulers.boundedElastic())));
+        return reportRepository.findById(reportId);
     }
 
     public Flux<WorkerMileageVisitResponse> getVisitsByStaffNumber(String staffNumber) {
@@ -266,16 +286,21 @@ public class MileageUploadService {
                     continue;
                 }
 
-                String staffNumber = getText(row, columns.get("staff number"), formatter);
-                String address = getText(row, columns.get("address"), formatter);
-                LocalDate date = parseDate(row.getCell(columns.get("date")), formatter);
-                TimeRange visitTime = parseTimeRange(row.getCell(columns.get("visit time")), formatter);
+                String staffNumber = getText(row, columns.get("Carer_No"), formatter);
+                String address = getText(row, columns.get("Client Address"), formatter);
+                LocalDate date = parseDate(row.getCell(columns.get("Date_of_Call")), formatter);
+                TimeRange visitTime = parseTimeRange(row.getCell(columns.get("Time_of_Call")), formatter);
+                if (visitTime == null || visitTime.startTime() == null) {
+                    continue;
+                }
+                String name = columns.containsKey("Name") ? getText(row, columns.get("Name"), formatter) : "";
+                String shift = columns.containsKey("Shifts") ? normalizeShift(getText(row, columns.get("Shifts"), formatter), visitTime.startTime()) : shiftForTime(visitTime.startTime());
 
                 if (staffNumber.isBlank() || address.isBlank()) {
-                    throw new IllegalArgumentException("Row " + (i + 1) + " must include Staff Number and Address.");
+                    continue;
                 }
 
-                visits.add(new VisitRow(staffNumber, LocalDateTime.of(date, visitTime.startTime()), date, visitTime.startTime(), visitTime.endTime(), address, null, null));
+                visits.add(new VisitRow(staffNumber, LocalDateTime.of(date, visitTime.startTime()), date, visitTime.startTime(), visitTime.endTime(), address, name, shift, null, null));
             }
 
             if (visits.isEmpty()) {
@@ -287,21 +312,35 @@ public class MileageUploadService {
     }
 
     private Map<String, Integer> findColumns(Row header, DataFormatter formatter) {
-        Map<String, Integer> columns = new HashMap<>();
+        Map<String, Integer> actualByKey = new HashMap<>();
         for (Cell cell : header) {
-            String value = formatter.formatCellValue(cell).trim().toLowerCase(Locale.ENGLISH);
+            String value = formatter.formatCellValue(cell).trim();
             if (!value.isBlank()) {
-                columns.put(value, cell.getColumnIndex());
+                actualByKey.put(columnKey(value), cell.getColumnIndex());
             }
         }
 
-        for (String required : List.of("staff number", "date", "visit time", "address")) {
+        Map<String, Integer> columns = new HashMap<>();
+        for (Map.Entry<String, List<String>> entry : COLUMN_ALIASES.entrySet()) {
+            for (String alias : entry.getValue()) {
+                Integer index = actualByKey.get(columnKey(alias));
+                if (index != null) {
+                    columns.put(entry.getKey(), index);
+                    break;
+                }
+            }
+        }
+
+        for (String required : List.of("Carer_No", "Date_of_Call", "Time_of_Call", "Client Address")) {
             if (!columns.containsKey(required)) {
-                throw new IllegalArgumentException("Missing required column: " + required);
+                throw new IllegalArgumentException("Input missing required columns: " + required + ". Found: " + actualByKey.keySet());
             }
         }
-
         return columns;
+    }
+
+    private String columnKey(String value) {
+        return value.toUpperCase(Locale.ENGLISH).replace(" ", "").replace("_", "");
     }
 
     private boolean isBlankRow(Row row, DataFormatter formatter) {
@@ -360,11 +399,18 @@ public class MileageUploadService {
 
         String value = formatter.formatCellValue(cell).trim().toUpperCase(Locale.ENGLISH);
         String[] parts = value.split("\\s*-\\s*", 2);
-        LocalTime startTime = parseTimeText(parts[0].trim(), value);
-        LocalTime endTime = parts.length > 1 && !parts[1].trim().isBlank()
-                ? parseTimeText(parts[1].trim(), value)
-                : null;
-        return new TimeRange(startTime, endTime);
+        if (parts.length != 2) {
+            return null;
+        }
+        try {
+            LocalTime startTime = parseTimeText(parts[0].trim(), value);
+            LocalTime endTime = !parts[1].trim().isBlank()
+                    ? parseTimeText(parts[1].trim(), value)
+                    : null;
+            return new TimeRange(startTime, endTime);
+        } catch (IllegalArgumentException ignored) {
+            return null;
+        }
     }
 
     private LocalTime parseTimeText(String value, String originalValue) {
@@ -379,15 +425,249 @@ public class MileageUploadService {
         throw new IllegalArgumentException("Invalid visit time value: " + originalValue);
     }
 
-    private Mono<List<VisitRow>> geocodeVisits(List<VisitRow> visits) {
-        Map<String, Mono<Location>> addressCache = new HashMap<>();
-        return Flux.fromIterable(visits)
-                .concatMap(visit -> geocode(visit, addressCache)
-                        .map(location -> visit.withLocation(location.lat(), location.lon())))
-                .collectList();
+    private String normalizeShift(String value, LocalTime startTime) {
+        if (List.of("AM", "Lunch", "Tea", "Bed").contains(value)) {
+            return value;
+        }
+        return shiftForTime(startTime);
     }
 
-    private Mono<List<MileageResult>> calculateMileage(List<VisitRow> visits) {
+    private String shiftForTime(LocalTime time) {
+        int minutes = time.getHour() * 60 + time.getMinute();
+        if (minutes < 11 * 60) {
+            return "AM";
+        }
+        if (minutes < 15 * 60 + 30) {
+            return "Lunch";
+        }
+        if (minutes < 18 * 60 + 30) {
+            return "Tea";
+        }
+        return "Bed";
+    }
+
+    private Mono<AnalysisResult> calculateMileage(List<VisitRow> visits) {
+        List<VisitRow> orderedVisits = visits.stream()
+                .sorted(Comparator.comparing(VisitRow::staffNumber)
+                        .thenComparing(VisitRow::visitDate)
+                        .thenComparing(VisitRow::startTime))
+                .toList();
+
+        Map<ShiftKey, List<VisitRow>> visitsByShift = new LinkedHashMap<>();
+        for (VisitRow visit : orderedVisits) {
+            visitsByShift.computeIfAbsent(new ShiftKey(visit.staffNumber(), visit.visitDate(), visit.shift()), ignored -> new ArrayList<>()).add(visit);
+        }
+
+        return Flux.fromIterable(visitsByShift.entrySet())
+                .concatMap(entry -> analyseShift(entry.getKey(), entry.getValue()))
+                .collectList()
+                .map(shiftResults -> toAnalysisResult(orderedVisits, shiftResults));
+    }
+
+    private AnalysisResult toAnalysisResult(List<VisitRow> orderedVisits, List<ShiftResult> shifts) {
+        Map<String, MileageResult> rowsByStaff = new TreeMap<>();
+        for (ShiftResult shift : shifts) {
+            MileageResult current = rowsByStaff.getOrDefault(shift.key().staffNumber(), new MileageResult(shift.key().staffNumber(), 0.0, 0.0, 0.0));
+            rowsByStaff.put(shift.key().staffNumber(), new MileageResult(
+                    shift.key().staffNumber(),
+                    current.totalMileageKm() + shift.optimisedKm(),
+                    current.totalOriginalMileageKm() + shift.originalKm(),
+                    current.totalSavedMileageKm() + shift.savedKm()));
+        }
+        return new AnalysisResult(orderedVisits, new ArrayList<>(rowsByStaff.values()), shifts);
+    }
+
+    private Mono<ShiftResult> analyseShift(ShiftKey key, List<VisitRow> visits) {
+        List<String> addresses = visits.stream().map(VisitRow::address).toList();
+        if (addresses.size() < 2) {
+            return Mono.just(new ShiftResult(key, visits, visits, 0.0, 0.0, 0.0, List.of(), List.of()));
+        }
+
+        return distanceMatrix(addresses)
+                .map(matrix -> {
+                    List<Double> originalLegs = new ArrayList<>();
+                    for (int i = 0; i < addresses.size() - 1; i++) {
+                        originalLegs.add(matrix[i][i + 1]);
+                    }
+                    double originalKm = originalLegs.stream().mapToDouble(Double::doubleValue).sum();
+                    List<Integer> optIndexes = optimisedIndexes(matrix);
+                    List<VisitRow> optimisedVisits = optIndexes.stream().map(visits::get).toList();
+                    List<Double> optimisedLegs = new ArrayList<>();
+                    for (int i = 0; i < optIndexes.size() - 1; i++) {
+                        optimisedLegs.add(matrix[optIndexes.get(i)][optIndexes.get(i + 1)]);
+                    }
+                    double optimisedKm = optimisedLegs.stream().mapToDouble(Double::doubleValue).sum();
+                    return new ShiftResult(key, visits, optimisedVisits, originalKm, optimisedKm, originalKm - optimisedKm, originalLegs, optimisedLegs);
+                });
+    }
+
+    private Mono<double[][]> distanceMatrix(List<String> addresses) {
+        int size = addresses.size();
+        double[][] distances = new double[size][size];
+        List<MatrixBatch> batches = new ArrayList<>();
+        for (int dStart = 0; dStart < size; dStart += BATCH_MAX_DIM) {
+            int dEnd = Math.min(size, dStart + BATCH_MAX_DIM);
+            int destinationCount = dEnd - dStart;
+            int maxOrigins = Math.max(1, Math.min(BATCH_MAX_DIM, BATCH_MAX_ELEM / destinationCount));
+            for (int oStart = 0; oStart < size; oStart += maxOrigins) {
+                int oEnd = Math.min(size, oStart + maxOrigins);
+                batches.add(new MatrixBatch(oStart, oEnd, dStart, dEnd));
+            }
+        }
+
+        return Flux.fromIterable(batches)
+                .concatMap(batch -> fetchDistanceBatch(addresses, batch)
+                        .doOnNext(response -> copyDistanceBatch(distances, batch, response)))
+                .then(Mono.just(distances));
+    }
+
+    private Mono<GoogleDistanceMatrixResponse> fetchDistanceBatch(List<String> addresses, MatrixBatch batch) {
+        return googleMapsClient.get()
+                .uri(uriBuilder -> uriBuilder
+                        .path("/maps/api/distancematrix/json")
+                        .queryParam("origins", String.join("|", addresses.subList(batch.originStart(), batch.originEnd())))
+                        .queryParam("destinations", String.join("|", addresses.subList(batch.destinationStart(), batch.destinationEnd())))
+                        .queryParam("mode", "driving")
+                        .queryParam("units", "metric")
+                        .queryParam("key", requireGoogleApiKey())
+                        .build())
+                .retrieve()
+                .onStatus(HttpStatusCode::isError, response -> response.bodyToMono(String.class)
+                        .defaultIfEmpty("")
+                        .flatMap(body -> Mono.error(new IllegalStateException(
+                                "Google Distance Matrix error (" + response.statusCode().value() + "): " + body))))
+                .bodyToMono(GoogleDistanceMatrixResponse.class);
+    }
+
+    private void copyDistanceBatch(double[][] distances, MatrixBatch batch, GoogleDistanceMatrixResponse response) {
+        if (response == null || !"OK".equals(response.getStatus())) {
+            throw new IllegalStateException("Google Distance Matrix returned status: " + (response == null ? "UNKNOWN" : response.getStatus()));
+        }
+        if (response.getRows() == null) {
+            throw new IllegalStateException("Google Distance Matrix response missing rows.");
+        }
+        for (int rowIndex = 0; rowIndex < batch.originEnd() - batch.originStart(); rowIndex++) {
+            GoogleDistanceMatrixResponse.GoogleDistanceMatrixRow row = response.getRows().get(rowIndex);
+            for (int columnIndex = 0; columnIndex < batch.destinationEnd() - batch.destinationStart(); columnIndex++) {
+                int i = batch.originStart() + rowIndex;
+                int j = batch.destinationStart() + columnIndex;
+                if (i == j || row == null || row.getElements() == null || columnIndex >= row.getElements().size()) {
+                    distances[i][j] = 0.0;
+                    continue;
+                }
+                GoogleDistanceMatrixResponse.GoogleDistanceMatrixElement element = row.getElements().get(columnIndex);
+                distances[i][j] = element != null && "OK".equals(element.getStatus()) && element.getDistance() != null && element.getDistance().getValue() != null
+                        ? element.getDistance().getValue() / METERS_PER_KM
+                        : 0.0;
+            }
+        }
+    }
+
+    private String requireGoogleApiKey() {
+        if (!StringUtils.hasText(googleApiKey)) {
+            throw new IllegalStateException("GOOGLE_API_KEY environment variable is required.");
+        }
+        return googleApiKey;
+    }
+
+    private List<Integer> optimisedIndexes(double[][] matrix) {
+        int n = matrix.length;
+        if (n <= BRUTE_FORCE_LIMIT) {
+            BestPath best = new BestPath(null, Double.MAX_VALUE);
+            permute(new ArrayList<>(), n, new boolean[n], matrix, best);
+            return best.path();
+        }
+        return nearestNeighbourThenTwoOpt(matrix);
+    }
+
+    private void permute(List<Integer> path, int n, boolean[] used, double[][] matrix, BestPath best) {
+        if (path.size() == n) {
+            double total = pathCost(path, matrix);
+            if (total < best.total()) {
+                best.replace(new ArrayList<>(path), total);
+            }
+            return;
+        }
+        for (int i = 0; i < n; i++) {
+            if (!used[i]) {
+                used[i] = true;
+                path.add(i);
+                permute(path, n, used, matrix, best);
+                path.remove(path.size() - 1);
+                used[i] = false;
+            }
+        }
+    }
+
+    private List<Integer> nearestNeighbourThenTwoOpt(double[][] matrix) {
+        int n = matrix.length;
+        List<Integer> best = null;
+        double bestTotal = Double.MAX_VALUE;
+        for (int start = 0; start < n; start++) {
+            List<Integer> path = nearestNeighbourPath(matrix, start);
+            path = twoOpt(path, matrix);
+            double total = pathCost(path, matrix);
+            if (total < bestTotal) {
+                bestTotal = total;
+                best = path;
+            }
+        }
+        return best == null ? List.of() : best;
+    }
+
+    private List<Integer> nearestNeighbourPath(double[][] matrix, int start) {
+        int n = matrix.length;
+        boolean[] used = new boolean[n];
+        used[start] = true;
+        List<Integer> path = new ArrayList<>();
+        path.add(start);
+        while (path.size() < n) {
+            int last = path.get(path.size() - 1);
+            int next = -1;
+            double best = Double.MAX_VALUE;
+            for (int i = 0; i < n; i++) {
+                if (!used[i] && matrix[last][i] < best) {
+                    best = matrix[last][i];
+                    next = i;
+                }
+            }
+            used[next] = true;
+            path.add(next);
+        }
+        return path;
+    }
+
+    private List<Integer> twoOpt(List<Integer> path, double[][] matrix) {
+        boolean improved = true;
+        List<Integer> current = new ArrayList<>(path);
+        while (improved) {
+            improved = false;
+            for (int i = 1; i < current.size() - 1; i++) {
+                for (int j = i + 1; j < current.size(); j++) {
+                    List<Integer> candidate = new ArrayList<>(current.subList(0, i));
+                    List<Integer> reversed = new ArrayList<>(current.subList(i, j + 1));
+                    java.util.Collections.reverse(reversed);
+                    candidate.addAll(reversed);
+                    candidate.addAll(current.subList(j + 1, current.size()));
+                    if (pathCost(candidate, matrix) < pathCost(current, matrix)) {
+                        current = candidate;
+                        improved = true;
+                    }
+                }
+            }
+        }
+        return current;
+    }
+
+    private double pathCost(List<Integer> path, double[][] matrix) {
+        double total = 0.0;
+        for (int i = 0; i < path.size() - 1; i++) {
+            total += matrix[path.get(i)][path.get(i + 1)];
+        }
+        return total;
+    }
+
+    private Mono<List<MileageResult>> calculateMileageLegacy(List<VisitRow> visits) {
         Map<String, List<VisitRow>> visitsByStaff = new LinkedHashMap<>();
         for (VisitRow visit : visits) {
             visitsByStaff.computeIfAbsent(visit.staffNumber(), ignored -> new ArrayList<>()).add(visit);
@@ -519,11 +799,12 @@ public class MileageUploadService {
 
         return Flux.fromIterable(locationsByDay.values())
                 .concatMap(locations -> calculateLocationDistances(staffNumber, locations))
-                .reduce(new MileageResult(staffNumber, 0.0, 0.0),
+                .reduce(new MileageResult(staffNumber, 0.0, 0.0, 0.0),
                         (total, day) -> new MileageResult(
                                 staffNumber,
                                 total.totalMileageKm() + day.totalMileageKm(),
-                                total.totalStraightLineMileageKm() + day.totalStraightLineMileageKm()));
+                                total.totalOriginalMileageKm() + day.totalOriginalMileageKm(),
+                                0.0));
     }
 
     private Mono<Location> geocode(VisitRow visit, Map<String, Mono<Location>> addressCache) {
@@ -534,7 +815,7 @@ public class MileageUploadService {
 
     private Mono<MileageResult> calculateLocationDistances(String staffNumber, List<Location> locations) {
         if (locations.size() < 2) {
-            return Mono.just(new MileageResult(staffNumber, 0.0, 0.0));
+            return Mono.just(new MileageResult(staffNumber, 0.0, 0.0, 0.0));
         }
 
         List<RoutePair> pairs = new ArrayList<>();
@@ -552,7 +833,7 @@ public class MileageUploadService {
                         pair.destination().lat(),
                         pair.destination().lon()))
                 .reduce(0.0, Double::sum)
-                .map(total -> new MileageResult(staffNumber, total, totalStraightLineMileageKm));
+                .map(total -> new MileageResult(staffNumber, total, totalStraightLineMileageKm, 0.0));
     }
 
     private Map<String, Double> straightLineMileageByStaff(List<WorkerMileageVisit> visits) {
@@ -789,24 +1070,204 @@ public class MileageUploadService {
         return candidateId > currentId;
     }
 
-    private byte[] buildWorkbook(List<MileageResult> results) throws IOException {
+    private byte[] buildWorkbook(AnalysisResult analysis) throws IOException {
         try (Workbook workbook = new XSSFWorkbook(); ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
-            Sheet sheet = workbook.createSheet("Mileage Results");
-            Row header = sheet.createRow(0);
-            header.createCell(0).setCellValue("Staff Number");
-            header.createCell(1).setCellValue("Driving Mileage (miles)");
-
-            for (int i = 0; i < results.size(); i++) {
-                MileageResult result = results.get(i);
-                Row row = sheet.createRow(i + 1);
-                row.createCell(0).setCellValue(result.staffNumber());
-                row.createCell(1).setCellValue(kmToMiles(result.totalMileageKm()));
-            }
-
-            sheet.autoSizeColumn(0);
-            sheet.autoSizeColumn(1);
+            writeOptimisedScheduleSheet(workbook, analysis);
+            writeCarerTotalsSheet(workbook, analysis.rows());
+            writeDailyTotalsSheet(workbook, analysis.shifts());
+            writeShiftBreakdownSheet(workbook, analysis.shifts());
+            writeLegsSheet(workbook, analysis.shifts());
             workbook.write(outputStream);
             return outputStream.toByteArray();
+        }
+    }
+
+    private void writeOptimisedScheduleSheet(Workbook workbook, AnalysisResult analysis) {
+        Sheet sheet = workbook.createSheet("Optimised Schedule");
+        Row header = sheet.createRow(0);
+        List<String> headers = List.of("Carer_No", "Client Address", "Name", "Date_of_Call", "Time_of_Call", "Shifts");
+        for (int i = 0; i < headers.size(); i++) {
+            header.createCell(i).setCellValue(headers.get(i));
+        }
+
+        List<VisitRow> rows = analysis.shifts().stream()
+                .sorted(Comparator.comparing((ShiftResult shift) -> shift.key().staffNumber())
+                        .thenComparing(shift -> shift.key().date())
+                        .thenComparingInt(shift -> shiftSort(shift.key().shift())))
+                .flatMap(shift -> shift.optimisedVisits().stream())
+                .toList();
+        for (int i = 0; i < rows.size(); i++) {
+            VisitRow visit = rows.get(i);
+            Row row = sheet.createRow(i + 1);
+            row.createCell(0).setCellValue(visit.staffNumber());
+            row.createCell(1).setCellValue(visit.address());
+            row.createCell(2).setCellValue(visit.name());
+            row.createCell(3).setCellValue(visit.visitDate().toString());
+            row.createCell(4).setCellValue(formatTimeRange(visit));
+            row.createCell(5).setCellValue(visit.shift());
+        }
+        autosize(sheet, headers.size());
+    }
+
+    private void writeCarerTotalsSheet(Workbook workbook, List<MileageResult> results) {
+        Sheet sheet = workbook.createSheet("Carer Totals");
+        Row header = sheet.createRow(0);
+        List<String> headers = List.of("Carer_No", "Total_Original_miles", "Total_Optimised_miles", "Total_Saved_miles", "Saved_pct");
+        for (int i = 0; i < headers.size(); i++) {
+            header.createCell(i).setCellValue(headers.get(i));
+        }
+
+        for (int i = 0; i < results.size(); i++) {
+            MileageResult result = results.get(i);
+            Row row = sheet.createRow(i + 1);
+            double originalMiles = kmToMiles(result.totalOriginalMileageKm());
+            double optimisedMiles = kmToMiles(result.totalMileageKm());
+            double savedMiles = kmToMiles(result.totalSavedMileageKm());
+            row.createCell(0).setCellValue(result.staffNumber());
+            row.createCell(1).setCellValue(originalMiles);
+            row.createCell(2).setCellValue(optimisedMiles);
+            row.createCell(3).setCellValue(savedMiles);
+            row.createCell(4).setCellValue(originalMiles == 0.0 ? 0.0 : roundMileage((savedMiles * 100.0) / originalMiles));
+        }
+        autosize(sheet, headers.size());
+    }
+
+    private void writeDailyTotalsSheet(Workbook workbook, List<ShiftResult> shifts) {
+        Sheet sheet = workbook.createSheet("Daily Totals");
+        Row header = sheet.createRow(0);
+        List<String> headers = List.of("Carer_No", "Date", "Total_Original_miles", "Total_Optimised_miles", "Total_Saved_miles", "Saved_pct", "Sessions");
+        for (int i = 0; i < headers.size(); i++) {
+            header.createCell(i).setCellValue(headers.get(i));
+        }
+
+        List<DailyMileageResult> results = dailyMileageResults(shifts);
+        for (int i = 0; i < results.size(); i++) {
+            DailyMileageResult result = results.get(i);
+            double originalMiles = kmToMiles(result.originalKm());
+            double optimisedMiles = kmToMiles(result.optimisedKm());
+            double savedMiles = kmToMiles(result.savedKm());
+            Row row = sheet.createRow(i + 1);
+            row.createCell(0).setCellValue(result.staffNumber());
+            row.createCell(1).setCellValue(result.date().toString());
+            row.createCell(2).setCellValue(originalMiles);
+            row.createCell(3).setCellValue(optimisedMiles);
+            row.createCell(4).setCellValue(savedMiles);
+            row.createCell(5).setCellValue(originalMiles == 0.0 ? 0.0 : Math.round((savedMiles * 1000.0) / originalMiles) / 10.0);
+            row.createCell(6).setCellValue(String.join(", ", result.sessions()));
+        }
+        autosize(sheet, headers.size());
+    }
+
+    private List<DailyMileageResult> dailyMileageResults(List<ShiftResult> shifts) {
+        Map<DailyKey, DailyMileageAccumulator> totalsByDay = new LinkedHashMap<>();
+        shifts.stream()
+                .sorted(Comparator.comparing((ShiftResult shift) -> shift.key().staffNumber())
+                        .thenComparing(shift -> shift.key().date())
+                        .thenComparingInt(shift -> shiftSort(shift.key().shift())))
+                .forEach(shift -> totalsByDay.computeIfAbsent(
+                                new DailyKey(shift.key().staffNumber(), shift.key().date()),
+                                ignored -> new DailyMileageAccumulator())
+                        .add(shift));
+
+        List<DailyMileageResult> results = new ArrayList<>();
+        for (Map.Entry<DailyKey, DailyMileageAccumulator> entry : totalsByDay.entrySet()) {
+            DailyMileageAccumulator totals = entry.getValue();
+            results.add(new DailyMileageResult(
+                    entry.getKey().staffNumber(),
+                    entry.getKey().date(),
+                    totals.originalKm(),
+                    totals.optimisedKm(),
+                    totals.savedKm(),
+                    totals.sessions()));
+        }
+        return results;
+    }
+
+    private void writeShiftBreakdownSheet(Workbook workbook, List<ShiftResult> shifts) {
+        Sheet sheet = workbook.createSheet("Shift Breakdown");
+        Row header = sheet.createRow(0);
+        List<String> headers = List.of("Carer_No", "Date", "Shift", "Visits", "Original_miles", "Optimised_miles", "Saved_miles", "Saved_pct", "Original_order", "Optimised_order");
+        for (int i = 0; i < headers.size(); i++) {
+            header.createCell(i).setCellValue(headers.get(i));
+        }
+
+        for (int i = 0; i < shifts.size(); i++) {
+            ShiftResult shift = shifts.get(i);
+            double originalMiles = kmToMiles(shift.originalKm());
+            double optimisedMiles = kmToMiles(shift.optimisedKm());
+            double savedMiles = kmToMiles(shift.savedKm());
+            Row row = sheet.createRow(i + 1);
+            row.createCell(0).setCellValue(shift.key().staffNumber());
+            row.createCell(1).setCellValue(shift.key().date().toString());
+            row.createCell(2).setCellValue(shift.key().shift());
+            row.createCell(3).setCellValue(shift.originalVisits().size());
+            row.createCell(4).setCellValue(originalMiles);
+            row.createCell(5).setCellValue(optimisedMiles);
+            row.createCell(6).setCellValue(savedMiles);
+            row.createCell(7).setCellValue(originalMiles == 0.0 ? 0.0 : Math.round((savedMiles * 1000.0) / originalMiles) / 10.0);
+            row.createCell(8).setCellValue(orderText(shift.originalVisits()));
+            row.createCell(9).setCellValue(orderText(shift.optimisedVisits()));
+        }
+        autosize(sheet, headers.size());
+    }
+
+    private void writeLegsSheet(Workbook workbook, List<ShiftResult> shifts) {
+        Sheet sheet = workbook.createSheet("Legs");
+        Row header = sheet.createRow(0);
+        List<String> headers = List.of("Carer_No", "Date", "Shift", "Type", "Step", "From", "To", "Distance_miles");
+        for (int i = 0; i < headers.size(); i++) {
+            header.createCell(i).setCellValue(headers.get(i));
+        }
+
+        int rowIndex = 1;
+        for (ShiftResult shift : shifts) {
+            rowIndex = writeLegRows(sheet, rowIndex, shift, "Original", shift.originalVisits(), shift.originalLegsKm());
+            rowIndex = writeLegRows(sheet, rowIndex, shift, "Optimised", shift.optimisedVisits(), shift.optimisedLegsKm());
+        }
+        autosize(sheet, headers.size());
+    }
+
+    private int writeLegRows(Sheet sheet, int rowIndex, ShiftResult shift, String type, List<VisitRow> visits, List<Double> legsKm) {
+        for (int i = 0; i < legsKm.size(); i++) {
+            Row row = sheet.createRow(rowIndex++);
+            row.createCell(0).setCellValue(shift.key().staffNumber());
+            row.createCell(1).setCellValue(shift.key().date().toString());
+            row.createCell(2).setCellValue(shift.key().shift());
+            row.createCell(3).setCellValue(type);
+            row.createCell(4).setCellValue(i + 1);
+            row.createCell(5).setCellValue(visits.get(i).address());
+            row.createCell(6).setCellValue(visits.get(i + 1).address());
+            row.createCell(7).setCellValue(kmToMiles(legsKm.get(i)));
+        }
+        return rowIndex;
+    }
+
+    private String orderText(List<VisitRow> visits) {
+        boolean hasNames = visits.stream().anyMatch(visit -> StringUtils.hasText(visit.name()));
+        return String.join(" -> ", visits.stream()
+                .map(visit -> hasNames && StringUtils.hasText(visit.name()) ? visit.name() : visit.address())
+                .toList());
+    }
+
+    private String formatTimeRange(VisitRow visit) {
+        String start = visit.startTime() == null ? "" : visit.startTime().format(DateTimeFormatter.ofPattern("HH:mm"));
+        String end = visit.endTime() == null ? "" : visit.endTime().format(DateTimeFormatter.ofPattern("HH:mm"));
+        return end.isBlank() ? start : start + "-" + end;
+    }
+
+    private int shiftSort(String shift) {
+        return switch (shift) {
+            case "AM" -> 0;
+            case "Lunch" -> 1;
+            case "Tea" -> 2;
+            case "Bed" -> 3;
+            default -> 99;
+        };
+    }
+
+    private void autosize(Sheet sheet, int columns) {
+        for (int i = 0; i < columns; i++) {
+            sheet.autoSizeColumn(i);
         }
     }
 
@@ -856,10 +1317,17 @@ public class MileageUploadService {
     }
 
     private String reportFileName(String reportMonth, LocalDateTime createdAt) {
-        String month = monthLabel(reportMonth)
+        String monthCode = reportMonth == null ? "" : reportMonth.trim()
                 .toLowerCase(Locale.ROOT)
                 .replaceAll("[^a-z0-9]+", "-")
                 .replaceAll("(^-|-$)", "");
+        String monthName = monthLabel(reportMonth)
+                .toLowerCase(Locale.ROOT)
+                .replaceAll("[^a-z0-9]+", "-")
+                .replaceAll("(^-|-$)", "");
+        String month = monthCode.isBlank() || monthCode.equals(monthName)
+                ? monthName
+                : monthCode + "-" + monthName;
         String generatedDate = createdAt.toLocalDate().format(DateTimeFormatter.ISO_LOCAL_DATE);
         return "worker-mileage-" + month + "-generated-" + generatedDate + ".xlsx";
     }
@@ -870,7 +1338,7 @@ public class MileageUploadService {
                         .reportId(reportId)
                         .staffNumber(result.staffNumber())
                         .totalMileage(roundMileage(result.totalMileageKm()))
-                        .totalStraightLineMileage(roundMileage(result.totalStraightLineMileageKm()))
+                        .totalStraightLineMileage(roundMileage(result.totalOriginalMileageKm()))
                         .build())
                 .flatMap(reportRowRepository::save)
                 .then();
@@ -902,16 +1370,15 @@ public class MileageUploadService {
 
         return Mono.zip(rows, visits)
                 .flatMap(tuple -> {
-                    Map<String, Double> straightLineMileageByStaff = straightLineMileageByStaff(tuple.getT2());
                     List<WorkerMileageReportRowResponse> rowResponses = tuple.getT1().stream()
                             .map(row -> WorkerMileageReportRowResponse.builder()
                                     .staffNumber(row.getStaffNumber())
                                     .totalMileage(row.getTotalMileage())
                                     .totalMileageKm(row.getTotalMileage())
                                     .totalMileageMiles(kmToMiles(row.getTotalMileage() == null ? 0.0 : row.getTotalMileage()))
-                                    .totalStraightLineMileage(roundMileage(straightLineMileageByStaff.getOrDefault(row.getStaffNumber(), 0.0)))
-                                    .totalStraightLineMileageKm(roundMileage(straightLineMileageByStaff.getOrDefault(row.getStaffNumber(), 0.0)))
-                                    .totalStraightLineMileageMiles(kmToMiles(straightLineMileageByStaff.getOrDefault(row.getStaffNumber(), 0.0)))
+                                    .totalStraightLineMileage(row.getTotalStraightLineMileage())
+                                    .totalStraightLineMileageKm(row.getTotalStraightLineMileage())
+                                    .totalStraightLineMileageMiles(kmToMiles(row.getTotalStraightLineMileage() == null ? 0.0 : row.getTotalStraightLineMileage()))
                                     .build())
                             .toList();
                     return toVisitResponsesWithMileage(tuple.getT2(), true)
@@ -975,6 +1442,12 @@ public class MileageUploadService {
     }
 
     private Mono<Double> distanceBetween(WorkerMileageVisit previous, WorkerMileageVisit current) {
+        if (StringUtils.hasText(previous.getAddress()) && StringUtils.hasText(current.getAddress())) {
+            return distanceMatrix(List.of(previous.getAddress(), current.getAddress()))
+                    .map(matrix -> matrix[0][1])
+                    .defaultIfEmpty(0.0)
+                    .onErrorReturn(0.0);
+        }
         if (previous.getLat() == null || previous.getLon() == null
                 || current.getLat() == null || current.getLon() == null) {
             return Mono.just(0.0);
@@ -1012,11 +1485,13 @@ public class MileageUploadService {
             LocalTime startTime,
             LocalTime endTime,
             String address,
+            String name,
+            String shift,
             Double lat,
             Double lon
     ) {
         private VisitRow withLocation(Double lat, Double lon) {
-            return new VisitRow(staffNumber, visitDateTime, visitDate, startTime, endTime, address, lat, lon);
+            return new VisitRow(staffNumber, visitDateTime, visitDate, startTime, endTime, address, name, shift, lat, lon);
         }
     }
 
@@ -1026,7 +1501,39 @@ public class MileageUploadService {
     private record RoutePair(Location origin, Location destination) {
     }
 
-    private record MileageResult(String staffNumber, double totalMileageKm, double totalStraightLineMileageKm) {
+    private record MileageResult(String staffNumber, double totalMileageKm, double totalOriginalMileageKm, double totalSavedMileageKm) {
+    }
+
+    private record ShiftKey(String staffNumber, LocalDate date, String shift) {
+    }
+
+    private record DailyKey(String staffNumber, LocalDate date) {
+    }
+
+    private record DailyMileageResult(
+            String staffNumber,
+            LocalDate date,
+            double originalKm,
+            double optimisedKm,
+            double savedKm,
+            List<String> sessions) {
+    }
+
+    private record ShiftResult(
+            ShiftKey key,
+            List<VisitRow> originalVisits,
+            List<VisitRow> optimisedVisits,
+            double originalKm,
+            double optimisedKm,
+            double savedKm,
+            List<Double> originalLegsKm,
+            List<Double> optimisedLegsKm) {
+    }
+
+    private record AnalysisResult(List<VisitRow> visits, List<MileageResult> rows, List<ShiftResult> shifts) {
+    }
+
+    private record MatrixBatch(int originStart, int originEnd, int destinationStart, int destinationEnd) {
     }
 
     private record TimeRange(LocalTime startTime, LocalTime endTime) {
@@ -1057,6 +1564,61 @@ public class MileageUploadService {
 
         private double totalStraightLineMileage() {
             return totalStraightLineMileage;
+        }
+    }
+
+    private static class DailyMileageAccumulator {
+
+        private double originalKm;
+        private double optimisedKm;
+        private double savedKm;
+        private final List<String> sessions = new ArrayList<>();
+
+        private void add(ShiftResult shift) {
+            originalKm += shift.originalKm();
+            optimisedKm += shift.optimisedKm();
+            savedKm += shift.savedKm();
+            sessions.add(shift.key().shift());
+        }
+
+        private double originalKm() {
+            return originalKm;
+        }
+
+        private double optimisedKm() {
+            return optimisedKm;
+        }
+
+        private double savedKm() {
+            return savedKm;
+        }
+
+        private List<String> sessions() {
+            return sessions;
+        }
+    }
+
+    private static class BestPath {
+
+        private List<Integer> path;
+        private double total;
+
+        private BestPath(List<Integer> path, double total) {
+            this.path = path;
+            this.total = total;
+        }
+
+        private List<Integer> path() {
+            return path == null ? List.of() : path;
+        }
+
+        private double total() {
+            return total;
+        }
+
+        private void replace(List<Integer> path, double total) {
+            this.path = path;
+            this.total = total;
         }
     }
 }
