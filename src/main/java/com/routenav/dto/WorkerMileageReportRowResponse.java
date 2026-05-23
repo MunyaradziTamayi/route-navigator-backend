@@ -18,4 +18,7 @@ public class WorkerMileageReportRowResponse {
     private Double totalStraightLineMileage;
     private Double totalStraightLineMileageKm;
     private Double totalStraightLineMileageMiles;
+    private Double totalSavedMileage;
+    private Double totalSavedMileageKm;
+    private Double totalSavedMileageMiles;
 }

@@ -997,9 +997,8 @@ public class MileageUploadService {
             for (WorkerMileageReportRow row : report.rows()) {
                 double rowMileage = row.getTotalMileage() == null ? 0.0 : row.getTotalMileage();
                 double storedStraightLineMileage = row.getTotalStraightLineMileage() == null ? 0.0 : row.getTotalStraightLineMileage();
-                double rowStraightLineMileage = straightLineMileageByStaff.containsKey(row.getStaffNumber())
-                        ? straightLineMileageByStaff.get(row.getStaffNumber())
-                        : storedStraightLineMileage;
+                double calculatedStraightLineMileage = straightLineMileageByStaff.getOrDefault(row.getStaffNumber(), 0.0);
+                double rowStraightLineMileage = calculatedStraightLineMileage > 0.0 ? calculatedStraightLineMileage : storedStraightLineMileage;
                 totalMileage += rowMileage;
                 totalStraightLineMileage += rowStraightLineMileage;
 
@@ -1352,6 +1351,7 @@ public class MileageUploadService {
                         .staffNumber(result.staffNumber())
                         .totalMileage(roundMileage(result.totalMileageKm()))
                         .totalStraightLineMileage(roundMileage(result.totalOriginalMileageKm()))
+                        .totalSavedMileage(roundMileage(result.totalSavedMileageKm()))
                         .build())
                 .flatMap(reportRowRepository::save)
                 .then();
@@ -1392,6 +1392,9 @@ public class MileageUploadService {
                                     .totalStraightLineMileage(row.getTotalStraightLineMileage())
                                     .totalStraightLineMileageKm(row.getTotalStraightLineMileage())
                                     .totalStraightLineMileageMiles(kmToMiles(row.getTotalStraightLineMileage() == null ? 0.0 : row.getTotalStraightLineMileage()))
+                                    .totalSavedMileage(row.getTotalSavedMileage())
+                                    .totalSavedMileageKm(row.getTotalSavedMileage())
+                                    .totalSavedMileageMiles(kmToMiles(row.getTotalSavedMileage() == null ? 0.0 : row.getTotalSavedMileage()))
                                     .build())
                             .toList();
                     return toVisitResponsesWithMileage(tuple.getT2(), true)

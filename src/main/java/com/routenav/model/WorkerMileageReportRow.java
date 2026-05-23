@@ -20,4 +20,5 @@ public class WorkerMileageReportRow {
     private String staffNumber;
     private Double totalMileage;
     private Double totalStraightLineMileage;
+    private Double totalSavedMileage;
 }
