@@ -3,7 +3,7 @@ spring:
     name: route-navigator
 
   r2dbc:
-    url: ${SPRING_R2DBC_URL:r2dbc:postgresql://localhost:5432/route_navigatordb}
+    url: ${SPRING_R2DBC_URL:r2dbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:route_navigatordb}}
     username: ${SPRING_R2DBC_USERNAME:postgres}
     password: ${SPRING_R2DBC_PASSWORD:admin}
 
@@ -14,11 +14,23 @@ spring:
 
 server:
   port: ${PORT:8080}
+  forward-headers-strategy: framework
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    disable-swagger-default-url: true
+
+app:
+  public-url: ${APP_PUBLIC_URL:}
 
 google:
   api-key: ${GOOGLE_API_KEY:}
   routes-base-url: https://routes.googleapis.com
   geocoding-base-url: https://maps.googleapis.com
+  route-matrix-batch-delay-ms: ${GOOGLE_ROUTE_MATRIX_BATCH_DELAY_MS:5}
 
   security:
     user:

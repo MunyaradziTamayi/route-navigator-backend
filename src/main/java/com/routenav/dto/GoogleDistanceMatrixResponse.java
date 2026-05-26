@@ -1,28 +1,24 @@
 package com.routenav.dto;
 
-import java.util.List;
 import lombok.Data;
 
 @Data
 public class GoogleDistanceMatrixResponse {
 
-    private String status;
-    private String errorMessage;
-    private List<GoogleDistanceMatrixRow> rows;
+    private Integer originIndex;
+
+    private Integer destinationIndex;
+
+    private Long distanceMeters;
+
+    private String condition;
+
+    private GoogleRouteMatrixStatus status;
 
     @Data
-    public static class GoogleDistanceMatrixRow {
-        private List<GoogleDistanceMatrixElement> elements;
-    }
-
-    @Data
-    public static class GoogleDistanceMatrixElement {
+    public static class GoogleRouteMatrixStatus {
+        private Integer code;
+        private String message;
         private String status;
-        private GoogleDistanceMatrixValue distance;
-    }
-
-    @Data
-    public static class GoogleDistanceMatrixValue {
-        private Long value;
     }
 }

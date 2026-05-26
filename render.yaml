@@ -9,6 +9,8 @@ services:
     envVars:
       - key: PORT
         value: 8080
+      - key: APP_PUBLIC_URL
+        value: https://route-navigator-backend.onrender.com
       - key: DB_HOST
         fromDatabase:
           name: routenav-db

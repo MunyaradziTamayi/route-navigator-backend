@@ -38,8 +38,9 @@ public class MileageUploadController {
     private final MileageUploadService mileageUploadService;
 
     @PostMapping(value = "/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public Mono<ResponseEntity<Object>> upload(@RequestPart("file") FilePart file) {
-        return mileageUploadService.calculateMonthlyMileageUpload(file)
+    public Mono<ResponseEntity<Object>> upload(@RequestPart("file") FilePart file,
+                                               @RequestParam(name = "includeVisits", defaultValue = "true") boolean includeVisits) {
+        return mileageUploadService.calculateMonthlyMileageUpload(file, includeVisits)
                 .map(upload -> ResponseEntity.ok((Object) upload))
                 .onErrorResume(IllegalArgumentException.class, e -> Mono.just(ResponseEntity.badRequest()
                         .body(ErrorResponse.builder().message(e.getMessage()).build())))
@@ -55,8 +56,10 @@ public class MileageUploadController {
     }
 
     @GetMapping("/uploads/{id}")
-    public Mono<ResponseEntity<WorkerMileageUploadResponse>> getUpload(@PathVariable("id") Long id) {
-        return mileageUploadService.getUpload(id)
+    public Mono<ResponseEntity<WorkerMileageUploadResponse>> getUpload(
+            @PathVariable("id") Long id,
+            @RequestParam(name = "includeVisits", defaultValue = "true") boolean includeVisits) {
+        return mileageUploadService.getUpload(id, includeVisits)
                 .map(ResponseEntity::ok)
                 .defaultIfEmpty(ResponseEntity.notFound().build());
     }

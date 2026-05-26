@@ -27,6 +27,15 @@ CREATE TABLE IF NOT EXISTS geocoded_addresses (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_geocoded_addresses_normalized_address
     ON geocoded_addresses (normalized_address);
 
+CREATE TABLE IF NOT EXISTS route_distance_cache (
+    origin_address      VARCHAR(1000) NOT NULL,
+    destination_address VARCHAR(1000) NOT NULL,
+    distance_km         DOUBLE PRECISION NOT NULL,
+    created_at          TIMESTAMP DEFAULT NOW(),
+    updated_at          TIMESTAMP DEFAULT NOW(),
+    PRIMARY KEY (origin_address, destination_address)
+);
+
 CREATE TABLE IF NOT EXISTS visits (
     id                BIGSERIAL PRIMARY KEY,
     origin_label      VARCHAR(500),

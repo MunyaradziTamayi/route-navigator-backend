@@ -20,6 +20,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.Duration;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
@@ -52,12 +53,15 @@ import org.springframework.http.codec.multipart.FilePart;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatusCode;
+import org.springframework.r2dbc.core.DatabaseClient;
 import org.springframework.util.StringUtils;
 import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientRequestException;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
+import reactor.util.retry.Retry;
 
 @Service
 public class MileageUploadService {
@@ -106,9 +110,13 @@ public class MileageUploadService {
 
     private final WorkerMileageVisitRepository visitRepository;
 
-    private final WebClient googleMapsClient;
+    private final DatabaseClient databaseClient;
+
+    private final WebClient googleRoutesClient;
 
     private final String googleApiKey;
+
+    private final Duration routeMatrixBatchDelay;
 
     public MileageUploadService(GeocodingService geocodingService,
                                 RoutingService routingService,
@@ -116,16 +124,20 @@ public class MileageUploadService {
                                 WorkerMileageReportRowRepository reportRowRepository,
                                 WorkerMileageUploadRepository uploadRepository,
                                 WorkerMileageVisitRepository visitRepository,
-                                @Qualifier("googleGeocodingClient") WebClient googleMapsClient,
-                                @Value("${google.api-key}") String googleApiKey) {
+                                DatabaseClient databaseClient,
+                                @Qualifier("googleRoutesClient") WebClient googleRoutesClient,
+                                @Value("${google.api-key}") String googleApiKey,
+                                @Value("${google.route-matrix-batch-delay-ms:1000}") long routeMatrixBatchDelayMs) {
         this.geocodingService = geocodingService;
         this.routingService = routingService;
         this.reportRepository = reportRepository;
         this.reportRowRepository = reportRowRepository;
         this.uploadRepository = uploadRepository;
         this.visitRepository = visitRepository;
-        this.googleMapsClient = googleMapsClient;
+        this.databaseClient = databaseClient;
+        this.googleRoutesClient = googleRoutesClient;
         this.googleApiKey = googleApiKey;
+        this.routeMatrixBatchDelay = Duration.ofMillis(Math.max(0, routeMatrixBatchDelayMs));
     }
 
     public Mono<List<WorkerMileageReportResponse>> calculateMonthlyMileageReports(FilePart file) {
@@ -135,13 +147,17 @@ public class MileageUploadService {
     }
 
     private Mono<List<WorkerMileageReportResponse>> calculateMonthlyMileageReports(byte[] bytes, Long uploadId) {
+        return calculateMonthlyMileageReports(bytes, uploadId, true);
+    }
+
+    private Mono<List<WorkerMileageReportResponse>> calculateMonthlyMileageReports(byte[] bytes, Long uploadId, boolean includeVisits) {
         return Mono.fromCallable(() -> parseVisits(bytes))
                 .subscribeOn(Schedulers.boundedElastic())
                 .flatMapMany(visits -> Flux.fromIterable(groupVisitsByMonth(visits).entrySet()))
                 .concatMap(entry -> calculateMileage(entry.getValue())
                         .flatMap(analysis -> Mono.fromCallable(() -> buildWorkbook(analysis))
                                 .subscribeOn(Schedulers.boundedElastic())
-                                .flatMap(workbook -> saveReport(uploadId, reportMonth(entry.getKey()), entry.getValue(), analysis.rows(), workbook))))
+                                .flatMap(workbook -> saveReport(uploadId, reportMonth(entry.getKey()), entry.getValue(), analysis.rows(), workbook, includeVisits))))
                 .collectList();
     }
 
@@ -151,14 +167,18 @@ public class MileageUploadService {
     }
 
     public Mono<WorkerMileageUploadResponse> calculateMonthlyMileageUpload(FilePart file) {
+        return calculateMonthlyMileageUpload(file, true);
+    }
+
+    public Mono<WorkerMileageUploadResponse> calculateMonthlyMileageUpload(FilePart file, boolean includeVisits) {
         return DataBufferUtils.join(file.content())
                 .map(this::toBytes)
                 .flatMap(bytes -> {
                     String fileHash = sha256Hex(bytes);
                     return uploadRepository.findFirstByFileHashOrderByCreatedAtDesc(fileHash)
-                            .flatMap(existingUpload -> getUpload(existingUpload.getId()))
+                            .flatMap(existingUpload -> getUpload(existingUpload.getId(), includeVisits))
                             .switchIfEmpty(saveUpload(file.filename(), fileHash)
-                                    .flatMap(upload -> calculateMonthlyMileageReports(bytes, upload.getId())
+                                    .flatMap(upload -> calculateMonthlyMileageReports(bytes, upload.getId(), includeVisits)
                                             .map(reports -> toUploadResponse(upload, reports, true))));
                 });
     }
@@ -204,9 +224,13 @@ public class MileageUploadService {
     }
 
     public Mono<WorkerMileageUploadResponse> getUpload(Long uploadId) {
+        return getUpload(uploadId, true);
+    }
+
+    public Mono<WorkerMileageUploadResponse> getUpload(Long uploadId, boolean includeVisits) {
         return uploadRepository.findById(uploadId)
                 .flatMap(upload -> reportRepository.findByUploadIdOrderByReportMonthAsc(uploadId)
-                        .flatMap(this::toReportResponse)
+                        .flatMap(report -> toReportResponse(report, includeVisits))
                         .collectList()
                         .map(reports -> toUploadResponse(upload, reports, true)));
     }
@@ -504,63 +528,209 @@ public class MileageUploadService {
     private Mono<double[][]> distanceMatrix(List<String> addresses) {
         int size = addresses.size();
         double[][] distances = new double[size][size];
+
+        Map<String, String> addressByKey = new LinkedHashMap<>();
+        for (String address : addresses) {
+            String key = normalizeCacheAddress(address);
+            if (StringUtils.hasText(key)) {
+                addressByKey.putIfAbsent(key, address);
+            }
+        }
+        List<String> uniqueKeys = new ArrayList<>(addressByKey.keySet());
+
+        if (uniqueKeys.size() < 2) {
+            return Mono.just(distances);
+        }
+
+        return loadCachedDistances(uniqueKeys)
+                .flatMap(cache -> fetchMissingDistanceBatches(uniqueKeys, addressByKey, cache)
+                        .then(Mono.fromCallable(() -> {
+                            copyCachedDistances(distances, addresses, cache);
+                            return distances;
+                        })));
+    }
+
+    private Mono<Map<String, Map<String, Double>>> loadCachedDistances(List<String> addressKeys) {
+        Map<String, Map<String, Double>> cache = new HashMap<>();
+        return Flux.fromIterable(addressKeys)
+                .concatMap(origin -> databaseClient.sql("""
+                                SELECT destination_address, distance_km
+                                FROM route_distance_cache
+                                WHERE origin_address = :origin
+                                """)
+                        .bind("origin", origin)
+                        .map((row, metadata) -> Map.entry(
+                                row.get("destination_address", String.class),
+                                row.get("distance_km", Double.class)))
+                        .all()
+                        .doOnNext(entry -> {
+                            if (entry.getKey() != null && entry.getValue() != null && addressKeys.contains(entry.getKey())) {
+                                cache.computeIfAbsent(origin, ignored -> new HashMap<>())
+                                        .put(entry.getKey(), entry.getValue());
+                            }
+                        }))
+                .then(Mono.just(cache));
+    }
+
+    private Mono<Void> fetchMissingDistanceBatches(List<String> uniqueKeys, Map<String, String> addressByKey,
+                                                   Map<String, Map<String, Double>> cache) {
+        List<String> originsNeedingFetch = uniqueKeys.stream()
+                .filter(origin -> uniqueKeys.stream()
+                        .anyMatch(destination -> !origin.equals(destination) && !hasCachedDistance(cache, origin, destination)))
+                .toList();
+
+        if (originsNeedingFetch.isEmpty()) {
+            return Mono.empty();
+        }
+
         List<MatrixBatch> batches = new ArrayList<>();
-        for (int dStart = 0; dStart < size; dStart += BATCH_MAX_DIM) {
-            int dEnd = Math.min(size, dStart + BATCH_MAX_DIM);
+        for (int dStart = 0; dStart < uniqueKeys.size(); dStart += BATCH_MAX_DIM) {
+            int dEnd = Math.min(uniqueKeys.size(), dStart + BATCH_MAX_DIM);
             int destinationCount = dEnd - dStart;
             int maxOrigins = Math.max(1, Math.min(BATCH_MAX_DIM, BATCH_MAX_ELEM / destinationCount));
-            for (int oStart = 0; oStart < size; oStart += maxOrigins) {
-                int oEnd = Math.min(size, oStart + maxOrigins);
+            for (int oStart = 0; oStart < originsNeedingFetch.size(); oStart += maxOrigins) {
+                int oEnd = Math.min(originsNeedingFetch.size(), oStart + maxOrigins);
                 batches.add(new MatrixBatch(oStart, oEnd, dStart, dEnd));
             }
         }
 
         return Flux.fromIterable(batches)
-                .concatMap(batch -> fetchDistanceBatch(addresses, batch)
-                        .doOnNext(response -> copyDistanceBatch(distances, batch, response)))
-                .then(Mono.just(distances));
+                .concatMap(batch -> Mono.delay(routeMatrixBatchDelay)
+                        .then(fetchDistanceBatch(uniqueKeys, originsNeedingFetch, addressByKey, batch))
+                        .flatMapMany(responses -> saveDistanceBatch(uniqueKeys, originsNeedingFetch, cache, batch, responses)))
+                .then();
     }
 
-    private Mono<GoogleDistanceMatrixResponse> fetchDistanceBatch(List<String> addresses, MatrixBatch batch) {
-        return googleMapsClient.get()
+    private boolean hasCachedDistance(Map<String, Map<String, Double>> cache, String origin, String destination) {
+        return cache.getOrDefault(origin, Map.of()).containsKey(destination);
+    }
+
+    private Mono<List<GoogleDistanceMatrixResponse>> fetchDistanceBatch(List<String> uniqueKeys,
+                                                                        List<String> originsNeedingFetch,
+                                                                        Map<String, String> addressByKey,
+                                                                        MatrixBatch batch) {
+        return googleRoutesClient.post()
                 .uri(uriBuilder -> uriBuilder
-                        .path("/maps/api/distancematrix/json")
-                        .queryParam("origins", String.join("|", addresses.subList(batch.originStart(), batch.originEnd())))
-                        .queryParam("destinations", String.join("|", addresses.subList(batch.destinationStart(), batch.destinationEnd())))
-                        .queryParam("mode", "driving")
-                        .queryParam("units", "metric")
-                        .queryParam("key", requireGoogleApiKey())
+                        .path("/distanceMatrix/v2:computeRouteMatrix")
                         .build())
+                .header("X-Goog-Api-Key", requireGoogleApiKey())
+                .header("X-Goog-FieldMask", "originIndex,destinationIndex,status,condition,distanceMeters")
+                .bodyValue(buildGoogleRouteMatrixRequest(uniqueKeys, originsNeedingFetch, addressByKey, batch))
                 .retrieve()
                 .onStatus(HttpStatusCode::isError, response -> response.bodyToMono(String.class)
                         .defaultIfEmpty("")
-                        .flatMap(body -> Mono.error(new IllegalStateException(
-                                "Google Distance Matrix error (" + response.statusCode().value() + "): " + body))))
-                .bodyToMono(GoogleDistanceMatrixResponse.class);
+                        .flatMap(body -> Mono.error(googleRoutesMatrixException(response.statusCode().value(), body))))
+                .bodyToFlux(GoogleDistanceMatrixResponse.class)
+                .collectList()
+                .retryWhen(Retry.backoff(5, Duration.ofSeconds(2))
+                        .maxBackoff(Duration.ofSeconds(30))
+                        .filter(this::isRetryableGoogleRoutesMatrixError)
+                        .onRetryExhaustedThrow((retryBackoffSpec, retrySignal) -> retrySignal.failure()));
     }
 
-    private void copyDistanceBatch(double[][] distances, MatrixBatch batch, GoogleDistanceMatrixResponse response) {
-        if (response == null || !"OK".equals(response.getStatus())) {
-            throw new IllegalStateException("Google Distance Matrix returned status: " + (response == null ? "UNKNOWN" : response.getStatus()));
+    private boolean isRetryableGoogleRoutesMatrixError(Throwable error) {
+        if (error instanceof GoogleRoutesMatrixRateLimitException || error instanceof WebClientRequestException) {
+            return true;
         }
-        if (response.getRows() == null) {
-            throw new IllegalStateException("Google Distance Matrix response missing rows.");
+        Throwable cause = error.getCause();
+        while (cause != null) {
+            String className = cause.getClass().getName();
+            if (className.contains("SocketException") || className.contains("TimeoutException")) {
+                return true;
+            }
+            cause = cause.getCause();
         }
-        for (int rowIndex = 0; rowIndex < batch.originEnd() - batch.originStart(); rowIndex++) {
-            GoogleDistanceMatrixResponse.GoogleDistanceMatrixRow row = response.getRows().get(rowIndex);
-            for (int columnIndex = 0; columnIndex < batch.destinationEnd() - batch.destinationStart(); columnIndex++) {
-                int i = batch.originStart() + rowIndex;
-                int j = batch.destinationStart() + columnIndex;
-                if (i == j || row == null || row.getElements() == null || columnIndex >= row.getElements().size()) {
+        return false;
+    }
+
+    private RuntimeException googleRoutesMatrixException(int statusCode, String body) {
+        String message = "Google Routes Matrix error (" + statusCode + "): " + body;
+        if (statusCode == 429) {
+            return new GoogleRoutesMatrixRateLimitException(message);
+        }
+        return new IllegalStateException(message);
+    }
+
+    private Map<String, Object> buildGoogleRouteMatrixRequest(List<String> uniqueKeys,
+                                                              List<String> originsNeedingFetch,
+                                                              Map<String, String> addressByKey,
+                                                              MatrixBatch batch) {
+        return Map.of(
+                "origins", originsNeedingFetch.subList(batch.originStart(), batch.originEnd()).stream()
+                        .map(addressByKey::get)
+                        .map(this::routeMatrixWaypoint)
+                        .toList(),
+                "destinations", uniqueKeys.subList(batch.destinationStart(), batch.destinationEnd()).stream()
+                        .map(addressByKey::get)
+                        .map(this::routeMatrixWaypoint)
+                        .toList(),
+                "travelMode", "DRIVE",
+                "routingPreference", "TRAFFIC_UNAWARE");
+    }
+
+    private Map<String, Object> routeMatrixWaypoint(String address) {
+        return Map.of("waypoint", Map.of("address", address));
+    }
+
+    private Flux<Void> saveDistanceBatch(List<String> uniqueKeys,
+                                         List<String> originsNeedingFetch,
+                                         Map<String, Map<String, Double>> cache,
+                                         MatrixBatch batch,
+                                         List<GoogleDistanceMatrixResponse> responses) {
+        if (responses == null) {
+            return Flux.error(new IllegalStateException("Google Routes Matrix returned an empty response."));
+        }
+
+        return Flux.fromIterable(responses)
+                .filter(response -> response != null
+                        && response.getOriginIndex() != null
+                        && response.getDestinationIndex() != null
+                        && "ROUTE_EXISTS".equals(response.getCondition())
+                        && response.getDistanceMeters() != null)
+                .concatMap(response -> {
+                    String origin = originsNeedingFetch.get(batch.originStart() + response.getOriginIndex());
+                    String destination = uniqueKeys.get(batch.destinationStart() + response.getDestinationIndex());
+                    if (origin.equals(destination)) {
+                        return Mono.empty();
+                    }
+
+                    double distanceKm = response.getDistanceMeters() / METERS_PER_KM;
+                    cache.computeIfAbsent(origin, ignored -> new HashMap<>()).put(destination, distanceKm);
+                    return saveCachedDistance(origin, destination, distanceKm);
+                });
+    }
+
+    private Mono<Void> saveCachedDistance(String origin, String destination, double distanceKm) {
+        return databaseClient.sql("""
+                        INSERT INTO route_distance_cache (origin_address, destination_address, distance_km, updated_at)
+                        VALUES (:origin, :destination, :distanceKm, NOW())
+                        ON CONFLICT (origin_address, destination_address)
+                        DO UPDATE SET distance_km = EXCLUDED.distance_km, updated_at = NOW()
+                        """)
+                .bind("origin", origin)
+                .bind("destination", destination)
+                .bind("distanceKm", distanceKm)
+                .fetch()
+                .rowsUpdated()
+                .then();
+    }
+
+    private void copyCachedDistances(double[][] distances, List<String> addresses, Map<String, Map<String, Double>> cache) {
+        for (int i = 0; i < addresses.size(); i++) {
+            String origin = normalizeCacheAddress(addresses.get(i));
+            for (int j = 0; j < addresses.size(); j++) {
+                String destination = normalizeCacheAddress(addresses.get(j));
+                if (i == j) {
                     distances[i][j] = 0.0;
-                    continue;
+                } else {
+                    distances[i][j] = cache.getOrDefault(origin, Map.of()).getOrDefault(destination, 0.0);
                 }
-                GoogleDistanceMatrixResponse.GoogleDistanceMatrixElement element = row.getElements().get(columnIndex);
-                distances[i][j] = element != null && "OK".equals(element.getStatus()) && element.getDistance() != null && element.getDistance().getValue() != null
-                        ? element.getDistance().getValue() / METERS_PER_KM
-                        : 0.0;
             }
         }
+    }
+
+    private String normalizeCacheAddress(String address) {
+        return address == null ? "" : address.trim().replaceAll("\\s+", " ").toLowerCase(Locale.ENGLISH);
     }
 
     private String requireGoogleApiKey() {
@@ -1312,7 +1482,8 @@ public class MileageUploadService {
                 .orElse(null);
     }
 
-    private Mono<WorkerMileageReportResponse> saveReport(Long uploadId, String reportMonth, List<VisitRow> visits, List<MileageResult> results, byte[] workbook) {
+    private Mono<WorkerMileageReportResponse> saveReport(Long uploadId, String reportMonth, List<VisitRow> visits,
+                                                         List<MileageResult> results, byte[] workbook, boolean includeVisits) {
         LocalDateTime createdAt = LocalDateTime.now();
         WorkerMileageReport report = WorkerMileageReport.builder()
                 .uploadId(uploadId)
@@ -1325,7 +1496,9 @@ public class MileageUploadService {
         return reportRepository.save(report)
                 .flatMap(saved -> saveReportRows(saved.getId(), results)
                         .then(saveReportVisits(saved.getId(), visits))
-                        .then(toReportResponse(saved)));
+                        .then(includeVisits
+                                ? toReportResponse(saved)
+                                : Mono.just(toReportResponse(saved, toReportRowResponses(results), List.of()))));
     }
 
     private String reportFileName(String reportMonth, LocalDateTime createdAt) {
@@ -1376,40 +1549,77 @@ public class MileageUploadService {
     }
 
     private Mono<WorkerMileageReportResponse> toReportResponse(WorkerMileageReport report) {
+        return toReportResponse(report, true);
+    }
+
+    private Mono<WorkerMileageReportResponse> toReportResponse(WorkerMileageReport report, boolean includeVisits) {
         Mono<List<WorkerMileageReportRow>> rows = reportRowRepository.findByReportIdOrderByStaffNumberAsc(report.getId())
                 .collectList();
+
+        if (!includeVisits) {
+            return rows.map(this::toReportRowResponses)
+                    .map(rowResponses -> toReportResponse(report, rowResponses, List.of()));
+        }
+
         Mono<List<WorkerMileageVisit>> visits = visitRepository.findByReportIdOrderByStaffNumberAscVisitDateAscStartTimeAsc(report.getId())
                 .collectList();
 
         return Mono.zip(rows, visits)
-                .flatMap(tuple -> {
-                    List<WorkerMileageReportRowResponse> rowResponses = tuple.getT1().stream()
-                            .map(row -> WorkerMileageReportRowResponse.builder()
-                                    .staffNumber(row.getStaffNumber())
-                                    .totalMileage(row.getTotalMileage())
-                                    .totalMileageKm(row.getTotalMileage())
-                                    .totalMileageMiles(kmToMiles(row.getTotalMileage() == null ? 0.0 : row.getTotalMileage()))
-                                    .totalStraightLineMileage(row.getTotalStraightLineMileage())
-                                    .totalStraightLineMileageKm(row.getTotalStraightLineMileage())
-                                    .totalStraightLineMileageMiles(kmToMiles(row.getTotalStraightLineMileage() == null ? 0.0 : row.getTotalStraightLineMileage()))
-                                    .totalSavedMileage(row.getTotalSavedMileage())
-                                    .totalSavedMileageKm(row.getTotalSavedMileage())
-                                    .totalSavedMileageMiles(kmToMiles(row.getTotalSavedMileage() == null ? 0.0 : row.getTotalSavedMileage()))
-                                    .build())
-                            .toList();
-                    return toVisitResponsesWithMileage(tuple.getT2(), true)
-                            .collectList()
-                            .map(visitResponses -> WorkerMileageReportResponse.builder()
-                                    .id(report.getId())
-                                    .uploadId(report.getUploadId())
-                                    .reportMonth(report.getReportMonth())
-                                    .fileName(report.getFileName())
-                                    .downloadUrl("/api/mileage/reports/" + report.getId() + "/download")
-                                    .createdAt(report.getCreatedAt())
-                                    .rows(rowResponses)
-                                    .visits(visitResponses)
-                                    .build());
-                });
+                .flatMap(tuple -> toVisitResponsesWithMileage(tuple.getT2(), true)
+                        .collectList()
+                        .map(visitResponses -> toReportResponse(report, toReportRowResponses(tuple.getT1()), visitResponses)));
+    }
+
+    private List<WorkerMileageReportRowResponse> toReportRowResponses(List<?> rows) {
+        return rows.stream()
+                .map(row -> {
+                    if (row instanceof WorkerMileageReportRow reportRow) {
+                        double totalMileage = reportRow.getTotalMileage() == null ? 0.0 : reportRow.getTotalMileage();
+                        double straightLineMileage = reportRow.getTotalStraightLineMileage() == null ? 0.0 : reportRow.getTotalStraightLineMileage();
+                        return WorkerMileageReportRowResponse.builder()
+                                .staffNumber(reportRow.getStaffNumber())
+                                .totalMileage(reportRow.getTotalMileage())
+                                .totalMileageKm(reportRow.getTotalMileage())
+                                .totalMileageMiles(kmToMiles(totalMileage))
+                                .totalStraightLineMileage(reportRow.getTotalStraightLineMileage())
+                                .totalStraightLineMileageKm(reportRow.getTotalStraightLineMileage())
+                                .totalStraightLineMileageMiles(kmToMiles(straightLineMileage))
+                                .totalSavedMileage(reportRow.getTotalSavedMileage())
+                                .totalSavedMileageKm(reportRow.getTotalSavedMileage())
+                                .totalSavedMileageMiles(kmToMiles(reportRow.getTotalSavedMileage() == null ? 0.0 : reportRow.getTotalSavedMileage()))
+                                .build();
+                    }
+
+                    MileageResult result = (MileageResult) row;
+                    return WorkerMileageReportRowResponse.builder()
+                            .staffNumber(result.staffNumber())
+                            .totalMileage(roundMileage(result.totalMileageKm()))
+                            .totalMileageKm(roundMileage(result.totalMileageKm()))
+                            .totalMileageMiles(kmToMiles(result.totalMileageKm()))
+                            .totalStraightLineMileage(roundMileage(result.totalOriginalMileageKm()))
+                            .totalStraightLineMileageKm(roundMileage(result.totalOriginalMileageKm()))
+                            .totalStraightLineMileageMiles(kmToMiles(result.totalOriginalMileageKm()))
+                            .totalSavedMileage(roundMileage(result.totalSavedMileageKm()))
+                            .totalSavedMileageKm(roundMileage(result.totalSavedMileageKm()))
+                            .totalSavedMileageMiles(kmToMiles(result.totalSavedMileageKm()))
+                            .build();
+                })
+                .toList();
+    }
+
+    private WorkerMileageReportResponse toReportResponse(WorkerMileageReport report,
+                                                         List<WorkerMileageReportRowResponse> rows,
+                                                         List<WorkerMileageVisitResponse> visits) {
+        return WorkerMileageReportResponse.builder()
+                .id(report.getId())
+                .uploadId(report.getUploadId())
+                .reportMonth(report.getReportMonth())
+                .fileName(report.getFileName())
+                .downloadUrl("/api/mileage/reports/" + report.getId() + "/download")
+                .createdAt(report.getCreatedAt())
+                .rows(rows)
+                .visits(visits)
+                .build();
     }
 
     private Flux<WorkerMileageVisitResponse> toVisitResponsesWithMileage(List<WorkerMileageVisit> visits, boolean ascending) {
@@ -1458,20 +1668,14 @@ public class MileageUploadService {
     }
 
     private Mono<Double> distanceBetween(WorkerMileageVisit previous, WorkerMileageVisit current) {
-        if (StringUtils.hasText(previous.getAddress()) && StringUtils.hasText(current.getAddress())) {
-            return distanceMatrix(List.of(previous.getAddress(), current.getAddress()))
-                    .map(matrix -> matrix[0][1])
-                    .defaultIfEmpty(0.0)
-                    .onErrorReturn(0.0);
-        }
         if (previous.getLat() == null || previous.getLon() == null
                 || current.getLat() == null || current.getLon() == null) {
             return Mono.just(0.0);
         }
 
-        return routingService.calculateDistanceKm(previous.getLat(), previous.getLon(), current.getLat(), current.getLon())
-                .defaultIfEmpty(0.0)
-                .onErrorReturn(0.0);
+        return Mono.just(straightLineDistanceKm(
+                new Location(previous.getLat(), previous.getLon()),
+                new Location(current.getLat(), current.getLon())));
     }
 
     private WorkerMileageVisitResponse toVisitResponse(WorkerMileageVisit visit, String previousAddress,
@@ -1550,6 +1754,12 @@ public class MileageUploadService {
     }
 
     private record MatrixBatch(int originStart, int originEnd, int destinationStart, int destinationEnd) {
+    }
+
+    private static class GoogleRoutesMatrixRateLimitException extends RuntimeException {
+        private GoogleRoutesMatrixRateLimitException(String message) {
+            super(message);
+        }
     }
 
     private record TimeRange(LocalTime startTime, LocalTime endTime) {
