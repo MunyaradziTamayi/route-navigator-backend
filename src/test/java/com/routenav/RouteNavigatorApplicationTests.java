@@ -7,7 +7,8 @@ import org.springframework.boot.test.context.SpringBootTest;
 		"spring.r2dbc.url=r2dbc:h2:mem:///routenavtest;DB_CLOSE_DELAY=-1;MODE=PostgreSQL",
 		"spring.r2dbc.username=sa",
 		"spring.r2dbc.password=",
-		"spring.sql.init.mode=always"
+		"spring.sql.init.mode=always",
+		"spring.sql.init.schema-locations=classpath:schema-h2.sql"
 })
 class RouteNavigatorApplicationTests {
 
