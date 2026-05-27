@@ -97,13 +97,35 @@ public class MileageUploadController {
                 .defaultIfEmpty(ResponseEntity.notFound().build());
     }
 
+    @GetMapping("/reports/master/download")
+    public Mono<ResponseEntity<Object>> downloadMasterReport(
+            @RequestParam(name = "month", required = false) String month,
+            @RequestParam(name = "year", required = false) Integer year) {
+        return mileageUploadService.buildMasterMileageWorkbook(month, year)
+                .map(workbook -> toDownloadResponse(workbook, "worker-mileage-master.xlsx"))
+                .defaultIfEmpty(ResponseEntity.notFound().build());
+    }
+
+    @GetMapping("/reports/routes/download")
+    public Mono<ResponseEntity<Object>> downloadOptimisedRoutes(
+            @RequestParam(name = "month", required = false) String month,
+            @RequestParam(name = "year", required = false) Integer year) {
+        return mileageUploadService.buildOptimisedRoutesWorkbook(month, year)
+                .map(workbook -> toDownloadResponse(workbook, "worker-mileage-optimized-routes.xlsx"))
+                .defaultIfEmpty(ResponseEntity.notFound().build());
+    }
+
     private ResponseEntity<Object> toDownloadResponse(WorkerMileageReport report) {
-        ByteArrayResource resource = new ByteArrayResource(report.getFileContent());
+        return toDownloadResponse(report.getFileContent(), report.getFileName());
+    }
+
+    private ResponseEntity<Object> toDownloadResponse(byte[] workbook, String fileName) {
+        ByteArrayResource resource = new ByteArrayResource(workbook);
         return ResponseEntity.ok()
                 .contentType(XLSX_MEDIA_TYPE)
-                .contentLength(report.getFileContent().length)
+                .contentLength(workbook.length)
                 .header(HttpHeaders.CONTENT_DISPOSITION, ContentDisposition.attachment()
-                        .filename(report.getFileName())
+                        .filename(fileName)
                         .build()
                         .toString())
                 .body((Object) resource);

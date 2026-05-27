@@ -11,4 +11,6 @@ public interface WorkerMileageVisitRepository extends ReactiveCrudRepository<Wor
     Flux<WorkerMileageVisit> findByStaffNumberOrderByVisitDateDescStartTimeDesc(String staffNumber);
 
     Flux<WorkerMileageVisit> findByReportIdOrderByStaffNumberAscVisitDateAscStartTimeAsc(Long reportId);
+
+    Flux<WorkerMileageVisit> findByReportIdOrderByStaffNumberAscVisitDateAscStartTimeAscIdAsc(Long reportId);
 }

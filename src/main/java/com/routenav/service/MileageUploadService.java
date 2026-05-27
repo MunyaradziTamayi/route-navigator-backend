@@ -157,7 +157,7 @@ public class MileageUploadService {
                 .concatMap(entry -> calculateMileage(entry.getValue())
                         .flatMap(analysis -> Mono.fromCallable(() -> buildWorkbook(analysis))
                                 .subscribeOn(Schedulers.boundedElastic())
-                                .flatMap(workbook -> saveReport(uploadId, reportMonth(entry.getKey()), entry.getValue(), analysis.rows(), workbook, includeVisits))))
+                                .flatMap(workbook -> saveReport(uploadId, reportMonth(entry.getKey()), optimisedVisits(analysis), analysis.rows(), workbook, includeVisits))))
                 .collectList();
     }
 
@@ -179,7 +179,9 @@ public class MileageUploadService {
                             .flatMap(existingUpload -> getUpload(existingUpload.getId(), includeVisits))
                             .switchIfEmpty(saveUpload(file.filename(), fileHash)
                                     .flatMap(upload -> calculateMonthlyMileageReports(bytes, upload.getId(), includeVisits)
-                                            .map(reports -> toUploadResponse(upload, reports, true))));
+                                            .map(reports -> toUploadResponse(upload, reports, true))
+                                            .onErrorResume(error -> cleanupFailedUpload(upload.getId())
+                                                    .then(Mono.error(error)))));
                 });
     }
 
@@ -277,6 +279,39 @@ public class MileageUploadService {
 
     public Mono<WorkerMileageReport> getReportFile(Long reportId) {
         return reportRepository.findById(reportId);
+    }
+
+    public Mono<byte[]> buildMasterMileageWorkbook(String reportMonth, Integer year) {
+        return findReports(reportMonth, year)
+                .flatMap(report -> Mono.zip(
+                                reportRowRepository.findByReportIdOrderByStaffNumberAsc(report.getId()).collectList(),
+                                visitRepository.findByReportIdOrderByStaffNumberAscVisitDateAscStartTimeAscIdAsc(report.getId()).collectList())
+                        .map(tuple -> new ReportRows(report, tuple.getT1(), tuple.getT2())))
+                .collectList()
+                .flatMap(reportRows -> {
+                    if (reportRows.isEmpty()) {
+                        return Mono.empty();
+                    }
+                    List<ReportRows> latestReportRows = latestReportRowsByMonth(reportRows);
+                    return Mono.fromCallable(() -> buildMasterMileageWorkbook(latestReportRows))
+                            .subscribeOn(Schedulers.boundedElastic());
+                });
+    }
+
+    public Mono<byte[]> buildOptimisedRoutesWorkbook(String reportMonth, Integer year) {
+        return findReports(reportMonth, year)
+                .flatMap(report -> visitRepository.findByReportIdOrderByStaffNumberAscVisitDateAscStartTimeAscIdAsc(report.getId())
+                        .collectList()
+                        .map(visits -> new ReportVisits(report, visits)))
+                .collectList()
+                .flatMap(reportVisits -> {
+                    if (reportVisits.isEmpty()) {
+                        return Mono.empty();
+                    }
+                    List<ReportVisits> latestReportVisits = latestReportVisitsByMonth(reportVisits);
+                    return Mono.fromCallable(() -> buildOptimisedRoutesWorkbook(latestReportVisits))
+                            .subscribeOn(Schedulers.boundedElastic());
+                });
     }
 
     public Flux<WorkerMileageVisitResponse> getVisitsByStaffNumber(String staffNumber) {
@@ -887,7 +922,12 @@ public class MileageUploadService {
         }
 
         if (monthText.matches("\\d{4}-\\d{2}")) {
-            YearMonth parsed = YearMonth.parse(monthText);
+            YearMonth parsed;
+            try {
+                parsed = YearMonth.parse(monthText);
+            } catch (DateTimeParseException e) {
+                throw new IllegalArgumentException("Invalid month value: " + reportMonth);
+            }
             return new ReportMonthFilter(parsed.toString(), parsed.getYear(), parsed.getMonthValue());
         }
 
@@ -1157,6 +1197,14 @@ public class MileageUploadService {
                 .build();
     }
 
+    private Mono<Void> cleanupFailedUpload(Long uploadId) {
+        if (uploadId == null) {
+            return Mono.empty();
+        }
+        return reportRepository.deleteByUploadId(uploadId)
+                .then(uploadRepository.deleteById(uploadId));
+    }
+
     private WorkerMileageTotalResponse toStoredMileageTotalResponse(String reportMonth, String label, List<ReportRows> reports) {
         Map<String, StaffMileageTotals> totalsByStaff = new TreeMap<>();
         double totalMileage = 0.0;
@@ -1220,6 +1268,18 @@ public class MileageUploadService {
         return new ArrayList<>(latestByMonth.values());
     }
 
+    private List<ReportVisits> latestReportVisitsByMonth(List<ReportVisits> reports) {
+        Map<String, ReportVisits> latestByMonth = new TreeMap<>();
+        for (ReportVisits visits : reports) {
+            String reportMonth = visits.report().getReportMonth();
+            ReportVisits current = latestByMonth.get(reportMonth);
+            if (current == null || isNewerReport(visits.report(), current.report())) {
+                latestByMonth.put(reportMonth, visits);
+            }
+        }
+        return new ArrayList<>(latestByMonth.values());
+    }
+
     private boolean isNewerReport(WorkerMileageReport candidate, WorkerMileageReport current) {
         LocalDateTime candidateCreatedAt = candidate.getCreatedAt();
         LocalDateTime currentCreatedAt = current.getCreatedAt();
@@ -1242,6 +1302,7 @@ public class MileageUploadService {
     private byte[] buildWorkbook(AnalysisResult analysis) throws IOException {
         try (Workbook workbook = new XSSFWorkbook(); ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
             writeOptimisedMileageSheet(workbook, analysis.rows());
+            writeOptimisedScheduleSheet(workbook, analysis);
             workbook.write(outputStream);
             return outputStream.toByteArray();
         }
@@ -1289,6 +1350,15 @@ public class MileageUploadService {
             row.createCell(5).setCellValue(visit.shift());
         }
         autosize(sheet, headers.size());
+    }
+
+    private List<VisitRow> optimisedVisits(AnalysisResult analysis) {
+        return analysis.shifts().stream()
+                .sorted(Comparator.comparing((ShiftResult shift) -> shift.key().staffNumber())
+                        .thenComparing(shift -> shift.key().date())
+                        .thenComparingInt(shift -> shiftSort(shift.key().shift())))
+                .flatMap(shift -> shift.optimisedVisits().stream())
+                .toList();
     }
 
     private void writeCarerTotalsSheet(Workbook workbook, List<MileageResult> results) {
@@ -1432,8 +1502,12 @@ public class MileageUploadService {
     }
 
     private String formatTimeRange(VisitRow visit) {
-        String start = visit.startTime() == null ? "" : visit.startTime().format(DateTimeFormatter.ofPattern("HH:mm"));
-        String end = visit.endTime() == null ? "" : visit.endTime().format(DateTimeFormatter.ofPattern("HH:mm"));
+        return formatTimeRange(visit.startTime(), visit.endTime());
+    }
+
+    private String formatTimeRange(LocalTime startTime, LocalTime endTime) {
+        String start = startTime == null ? "" : startTime.format(DateTimeFormatter.ofPattern("HH:mm"));
+        String end = endTime == null ? "" : endTime.format(DateTimeFormatter.ofPattern("HH:mm"));
         return end.isBlank() ? start : start + "-" + end;
     }
 
@@ -1469,6 +1543,90 @@ public class MileageUploadService {
 
             sheet.autoSizeColumn(0);
             sheet.autoSizeColumn(1);
+            workbook.write(outputStream);
+            return outputStream.toByteArray();
+        }
+    }
+
+    private byte[] buildMasterMileageWorkbook(List<ReportRows> reports) throws IOException {
+        Map<String, StaffMileageTotals> totalsByStaff = masterMileageTotalsByStaff(reports);
+
+        try (Workbook workbook = new XSSFWorkbook(); ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
+            Sheet sheet = workbook.createSheet("Mileage Summary");
+            Row header = sheet.createRow(0);
+            header.createCell(0).setCellValue("Staff Number");
+            header.createCell(1).setCellValue("Original Mileage");
+            header.createCell(2).setCellValue("Optimized Mileage");
+            header.createCell(3).setCellValue("Variance (Saved)");
+
+            int rowIndex = 1;
+            for (Map.Entry<String, StaffMileageTotals> entry : totalsByStaff.entrySet()) {
+                double originalMiles = kmToMiles(entry.getValue().totalStraightLineMileage());
+                double optimizedMiles = kmToMiles(entry.getValue().totalMileage());
+                double savedMiles = roundMileage(Math.max(0.0, originalMiles - optimizedMiles));
+
+                Row row = sheet.createRow(rowIndex++);
+                row.createCell(0).setCellValue(entry.getKey());
+                row.createCell(1).setCellValue(originalMiles);
+                row.createCell(2).setCellValue(optimizedMiles);
+                row.createCell(3).setCellValue(savedMiles);
+            }
+
+            autosize(sheet, 4);
+            workbook.write(outputStream);
+            return outputStream.toByteArray();
+        }
+    }
+
+    private Map<String, StaffMileageTotals> masterMileageTotalsByStaff(List<ReportRows> reports) {
+        Map<String, StaffMileageTotals> totalsByStaff = new TreeMap<>();
+        for (ReportRows report : reports) {
+            Map<String, Double> straightLineMileageByStaff = straightLineMileageByStaff(report.visits());
+            for (WorkerMileageReportRow row : report.rows()) {
+                double rowMileage = row.getTotalMileage() == null ? 0.0 : row.getTotalMileage();
+                double storedStraightLineMileage = row.getTotalStraightLineMileage() == null ? 0.0 : row.getTotalStraightLineMileage();
+                double calculatedStraightLineMileage = straightLineMileageByStaff.getOrDefault(row.getStaffNumber(), 0.0);
+                double rowStraightLineMileage = calculatedStraightLineMileage > 0.0 ? calculatedStraightLineMileage : storedStraightLineMileage;
+
+                totalsByStaff.computeIfAbsent(row.getStaffNumber(), ignored -> new StaffMileageTotals())
+                        .add(rowMileage, rowStraightLineMileage);
+            }
+        }
+        return totalsByStaff;
+    }
+
+    private byte[] buildOptimisedRoutesWorkbook(List<ReportVisits> reports) throws IOException {
+        try (Workbook workbook = new XSSFWorkbook(); ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
+            Sheet sheet = workbook.createSheet("Optimized Routes");
+            Row header = sheet.createRow(0);
+            List<String> headers = List.of(
+                    "Staff Number",
+                    "Date",
+                    "Visit Time",
+                    "Optimized Routes");
+            for (int i = 0; i < headers.size(); i++) {
+                header.createCell(i).setCellValue(headers.get(i));
+            }
+
+            List<WorkerMileageVisit> visits = reports.stream()
+                    .sorted(Comparator.comparing((ReportVisits report) -> report.report().getReportMonth()))
+                    .flatMap(report -> report.visits().stream())
+                    .toList();
+            List<WorkerMileageVisitResponse> visitResponses = toVisitResponsesWithMileage(visits, true)
+                    .collectList()
+                    .blockOptional()
+                    .orElse(List.of());
+
+            int rowIndex = 1;
+            for (WorkerMileageVisitResponse visit : visitResponses) {
+                Row row = sheet.createRow(rowIndex++);
+                row.createCell(0).setCellValue(visit.getStaffNumber());
+                row.createCell(1).setCellValue(visit.getVisitDate() == null ? "" : visit.getVisitDate().toString());
+                row.createCell(2).setCellValue(formatTimeRange(visit.getStartTime(), visit.getEndTime()));
+                row.createCell(3).setCellValue(visit.getAddress());
+            }
+
+            autosize(sheet, headers.size());
             workbook.write(outputStream);
             return outputStream.toByteArray();
         }
@@ -1772,6 +1930,9 @@ public class MileageUploadService {
     }
 
     private record ReportRows(WorkerMileageReport report, List<WorkerMileageReportRow> rows, List<WorkerMileageVisit> visits) {
+    }
+
+    private record ReportVisits(WorkerMileageReport report, List<WorkerMileageVisit> visits) {
     }
 
     private static class StaffMileageTotals {
