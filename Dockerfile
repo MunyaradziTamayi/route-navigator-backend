@@ -24,4 +24,5 @@ COPY --from=build /app/build/libs/*.jar app.jar
 EXPOSE 8080
 
 # Run the application
-ENTRYPOINT ["java", "-jar", "app.jar"]
+# Without this the JVM only uses 25% of the container memory for heap.
+ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75", "-jar", "app.jar"]

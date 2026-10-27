@@ -45,6 +45,8 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.HexFormat;
+import java.util.Iterator;
+import com.github.pjfanning.xlsx.StreamingReader;
 import org.apache.poi.ss.usermodel.Cell;
 import org.apache.poi.ss.usermodel.CellType;
 import org.apache.poi.ss.usermodel.DataFormatter;
@@ -52,7 +54,8 @@ import org.apache.poi.ss.usermodel.DateUtil;
 import org.apache.poi.ss.usermodel.Row;
 import org.apache.poi.ss.usermodel.Sheet;
 import org.apache.poi.ss.usermodel.Workbook;
-import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+import org.apache.poi.xssf.streaming.SXSSFSheet;
+import org.apache.poi.xssf.streaming.SXSSFWorkbook;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.core.io.buffer.DataBuffer;
@@ -83,6 +86,7 @@ public class MileageUploadService {
     private static final int BATCH_MAX_ELEM = 100;
     private static final int ROUTE_MATRIX_CONCURRENCY = 4;
     private static final int CACHE_QUERY_CHUNK = 500;
+    private static final int REPORT_ROW_WINDOW = 200;
 
     private static final Map<String, List<String>> COLUMN_ALIASES = Map.of(
             "Carer_No", List.of("Carer_No", "Carer No", "CarerNo", "Carer Number", "Staff Number", "Staff No", "StaffNo", "Worker Number", "Worker No", "WorkerNo", "Employee No", "Employee Number"),
@@ -370,26 +374,30 @@ public class MileageUploadService {
     }
 
     private List<VisitRow> parseVisits(byte[] bytes) throws IOException {
-        try (Workbook workbook = new XSSFWorkbook(new ByteArrayInputStream(bytes))) {
-            Sheet sheet = workbook.getSheetAt(0);
-            Row header = sheet.getRow(sheet.getFirstRowNum());
-            if (header == null) {
+        // Stream rows instead of loading the whole sheet: large uploads otherwise exhaust the heap.
+        try (Workbook workbook = StreamingReader.builder()
+                .rowCacheSize(100)
+                .bufferSize(4096)
+                .open(new ByteArrayInputStream(bytes))) {
+            Iterator<Row> rows = workbook.getSheetAt(0).rowIterator();
+            if (!rows.hasNext()) {
                 throw new IllegalArgumentException("The Excel file is empty.");
             }
+            Row header = rows.next();
 
             DataFormatter formatter = new DataFormatter();
             Map<String, Integer> columns = findColumns(header, formatter);
             List<VisitRow> visits = new ArrayList<>();
             List<String> skippedRows = new ArrayList<>();
 
-            for (int i = header.getRowNum() + 1; i <= sheet.getLastRowNum(); i++) {
-                Row row = sheet.getRow(i);
-                if (row == null || isBlankRow(row, formatter)) {
+            while (rows.hasNext()) {
+                Row row = rows.next();
+                if (isBlankRow(row, formatter)) {
                     continue;
                 }
 
                 // Excel row numbers are 1-based.
-                int excelRow = i + 1;
+                int excelRow = row.getRowNum() + 1;
                 String staffNumber = getText(row, columns.get("Carer_No"), formatter);
                 String address = getText(row, columns.get("Client Address"), formatter);
                 if (staffNumber.isBlank() || address.isBlank()) {
@@ -752,10 +760,12 @@ public class MileageUploadService {
             log.info("Fetching {} Google route matrix batches ({} elements)", batches.size(),
                     batches.stream().mapToInt(MatrixBatch::elements).sum());
         }
+        // Fetch concurrently but write one batch at a time: concurrent upserts of overlapping pairs deadlock.
         return Flux.fromIterable(batches)
                 .flatMap(batch -> Mono.delay(reserveRouteMatrixQuota(batch))
                         .then(fetchDistanceBatch(addressByKey, batch))
-                        .flatMapMany(responses -> saveDistanceBatch(batch, responses)), ROUTE_MATRIX_CONCURRENCY);
+                        .flatMap(responses -> toCachedDistances(batch, responses)), ROUTE_MATRIX_CONCURRENCY)
+                .concatMap(distances -> saveCachedDistances(distances).thenMany(Flux.fromIterable(distances)));
     }
 
     // Google bills and rate-limits the matrix per element (origins x destinations). Batches share one timeline
@@ -835,9 +845,9 @@ public class MileageUploadService {
         return Map.of("waypoint", Map.of("address", address));
     }
 
-    private Flux<CachedDistance> saveDistanceBatch(MatrixBatch batch, List<GoogleDistanceMatrixResponse> responses) {
+    private Mono<List<CachedDistance>> toCachedDistances(MatrixBatch batch, List<GoogleDistanceMatrixResponse> responses) {
         if (responses == null) {
-            return Flux.error(new IllegalStateException("Google Routes Matrix returned an empty response."));
+            return Mono.error(new IllegalStateException("Google Routes Matrix returned an empty response."));
         }
 
         List<CachedDistance> distances = responses.stream()
@@ -851,9 +861,11 @@ public class MileageUploadService {
                         batch.destinations().get(response.getDestinationIndex()),
                         response.getDistanceMeters() / METERS_PER_KM))
                 .filter(distance -> !distance.origin().equals(distance.destination()))
+                // A consistent row order keeps concurrent uploads from deadlocking on the same pairs.
+                .sorted(Comparator.comparing(CachedDistance::origin).thenComparing(CachedDistance::destination))
                 .toList();
 
-        return saveCachedDistances(distances).thenMany(Flux.fromIterable(distances));
+        return Mono.just(distances);
     }
 
     private Mono<Void> saveCachedDistances(List<CachedDistance> distances) {
@@ -1457,7 +1469,7 @@ public class MileageUploadService {
     }
 
     private byte[] buildWorkbook(AnalysisResult analysis) throws IOException {
-        try (Workbook workbook = new XSSFWorkbook(); ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
+        try (Workbook workbook = newReportWorkbook(); ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
             writeOptimisedMileageSheet(workbook, analysis.rows());
             writeOptimisedScheduleSheet(workbook, analysis);
             workbook.write(outputStream);
@@ -1466,7 +1478,7 @@ public class MileageUploadService {
     }
 
     private void writeOptimisedMileageSheet(Workbook workbook, List<MileageResult> results) {
-        Sheet sheet = workbook.createSheet("Mileage Results");
+        Sheet sheet = createSheet(workbook, "Mileage Results");
         Row header = sheet.createRow(0);
         header.createCell(0).setCellValue("Staff Number");
         header.createCell(1).setCellValue("Optimized Mileage (miles)");
@@ -1483,7 +1495,7 @@ public class MileageUploadService {
     }
 
     private void writeOptimisedScheduleSheet(Workbook workbook, AnalysisResult analysis) {
-        Sheet sheet = workbook.createSheet("Optimised Schedule");
+        Sheet sheet = createSheet(workbook, "Optimised Schedule");
         Row header = sheet.createRow(0);
         List<String> headers = List.of("Carer_No", "Client Address", "Name", "Date_of_Call", "Time_of_Call", "Shifts");
         for (int i = 0; i < headers.size(); i++) {
@@ -1519,7 +1531,7 @@ public class MileageUploadService {
     }
 
     private void writeCarerTotalsSheet(Workbook workbook, List<MileageResult> results) {
-        Sheet sheet = workbook.createSheet("Carer Totals");
+        Sheet sheet = createSheet(workbook, "Carer Totals");
         Row header = sheet.createRow(0);
         List<String> headers = List.of("Carer_No", "Total_Original_miles", "Total_Optimised_miles", "Total_Saved_miles", "Saved_pct");
         for (int i = 0; i < headers.size(); i++) {
@@ -1542,7 +1554,7 @@ public class MileageUploadService {
     }
 
     private void writeDailyTotalsSheet(Workbook workbook, List<ShiftResult> shifts) {
-        Sheet sheet = workbook.createSheet("Daily Totals");
+        Sheet sheet = createSheet(workbook, "Daily Totals");
         Row header = sheet.createRow(0);
         List<String> headers = List.of("Carer_No", "Date", "Total_Original_miles", "Total_Optimised_miles", "Total_Saved_miles", "Saved_pct", "Sessions");
         for (int i = 0; i < headers.size(); i++) {
@@ -1593,7 +1605,7 @@ public class MileageUploadService {
     }
 
     private void writeShiftBreakdownSheet(Workbook workbook, List<ShiftResult> shifts) {
-        Sheet sheet = workbook.createSheet("Shift Breakdown");
+        Sheet sheet = createSheet(workbook, "Shift Breakdown");
         Row header = sheet.createRow(0);
         List<String> headers = List.of("Carer_No", "Date", "Shift", "Visits", "Original_miles", "Optimised_miles", "Saved_miles", "Saved_pct", "Original_order", "Optimised_order");
         for (int i = 0; i < headers.size(); i++) {
@@ -1621,7 +1633,7 @@ public class MileageUploadService {
     }
 
     private void writeLegsSheet(Workbook workbook, List<ShiftResult> shifts) {
-        Sheet sheet = workbook.createSheet("Legs");
+        Sheet sheet = createSheet(workbook, "Legs");
         Row header = sheet.createRow(0);
         List<String> headers = List.of("Carer_No", "Date", "Shift", "Type", "Step", "From", "To", "Distance_miles");
         for (int i = 0; i < headers.size(); i++) {
@@ -1678,6 +1690,29 @@ public class MileageUploadService {
         };
     }
 
+    // Streams rows to compressed temp files so large reports don't hold every row in memory.
+    private Workbook newReportWorkbook() {
+        return new SXSSFWorkbook(null, REPORT_ROW_WINDOW, true) {
+            @Override
+            public void close() throws IOException {
+                try {
+                    super.close();
+                } finally {
+                    dispose();
+                }
+            }
+        };
+    }
+
+    private Sheet createSheet(Workbook workbook, String name) {
+        Sheet sheet = workbook.createSheet(name);
+        // Streamed rows are flushed as they are written, so column widths must be tracked up front.
+        if (sheet instanceof SXSSFSheet streamingSheet) {
+            streamingSheet.trackAllColumnsForAutoSizing();
+        }
+        return sheet;
+    }
+
     private void autosize(Sheet sheet, int columns) {
         for (int i = 0; i < columns; i++) {
             sheet.autoSizeColumn(i);
@@ -1685,8 +1720,8 @@ public class MileageUploadService {
     }
 
     private byte[] buildWorkbookFromRows(List<WorkerMileageReportRow> rows) throws IOException {
-        try (Workbook workbook = new XSSFWorkbook(); ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
-            Sheet sheet = workbook.createSheet("Mileage Results");
+        try (Workbook workbook = newReportWorkbook(); ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
+            Sheet sheet = createSheet(workbook, "Mileage Results");
             Row header = sheet.createRow(0);
             header.createCell(0).setCellValue("Staff Number");
             header.createCell(1).setCellValue("Driving Mileage (miles)");
@@ -1708,8 +1743,8 @@ public class MileageUploadService {
     private byte[] buildMasterMileageWorkbook(List<ReportRows> reports) throws IOException {
         Map<String, StaffMileageTotals> totalsByStaff = masterMileageTotalsByStaff(reports);
 
-        try (Workbook workbook = new XSSFWorkbook(); ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
-            Sheet sheet = workbook.createSheet("Mileage Summary");
+        try (Workbook workbook = newReportWorkbook(); ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
+            Sheet sheet = createSheet(workbook, "Mileage Summary");
             Row header = sheet.createRow(0);
             header.createCell(0).setCellValue("Staff Number");
             header.createCell(1).setCellValue("Original Mileage");
@@ -1753,8 +1788,8 @@ public class MileageUploadService {
     }
 
     private byte[] buildOptimisedRoutesWorkbook(List<ReportVisits> reports) throws IOException {
-        try (Workbook workbook = new XSSFWorkbook(); ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
-            Sheet sheet = workbook.createSheet("Optimized Routes");
+        try (Workbook workbook = newReportWorkbook(); ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
+            Sheet sheet = createSheet(workbook, "Optimized Routes");
             Row header = sheet.createRow(0);
             List<String> headers = List.of(
                     "Staff Number",
