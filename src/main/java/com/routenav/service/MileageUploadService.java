@@ -44,9 +44,11 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.HexFormat;
 import java.util.Iterator;
 import com.github.pjfanning.xlsx.StreamingReader;
+import com.github.pjfanning.xlsx.exceptions.ExcelRuntimeException;
 import org.apache.poi.ss.usermodel.Cell;
 import org.apache.poi.ss.usermodel.CellType;
 import org.apache.poi.ss.usermodel.DataFormatter;
@@ -71,6 +73,7 @@ import org.springframework.web.reactive.function.client.WebClientRequestExceptio
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.publisher.Sinks;
 import reactor.core.scheduler.Schedulers;
 import reactor.util.retry.Retry;
 
@@ -87,6 +90,9 @@ public class MileageUploadService {
     private static final int ROUTE_MATRIX_CONCURRENCY = 4;
     private static final int CACHE_QUERY_CHUNK = 500;
     private static final int REPORT_ROW_WINDOW = 200;
+    private static final String UPLOAD_PROCESSING = "PROCESSING";
+    private static final String UPLOAD_COMPLETED = "COMPLETED";
+    private static final String UPLOAD_FAILED = "FAILED";
 
     private static final Map<String, List<String>> COLUMN_ALIASES = Map.of(
             "Carer_No", List.of("Carer_No", "Carer No", "CarerNo", "Carer Number", "Staff Number", "Staff No", "StaffNo", "Worker Number", "Worker No", "WorkerNo", "Employee No", "Employee Number"),
@@ -145,6 +151,8 @@ public class MileageUploadService {
 
     private long routeMatrixNextSlotNanos = System.nanoTime();
 
+    private final Map<Long, Mono<Void>> runningUploads = new ConcurrentHashMap<>();
+
     public MileageUploadService(GeocodingService geocodingService,
                                 RoutingService routingService,
                                 WorkerMileageReportRepository reportRepository,
@@ -199,36 +207,84 @@ public class MileageUploadService {
         return calculateMonthlyMileageUpload(file, true);
     }
 
+    // Waits for the background calculation. A dropped connection only stops the wait: the calculation finishes
+    // and uploading the same file again returns the result (or rejoins the calculation if it is still running).
     public Mono<WorkerMileageUploadResponse> calculateMonthlyMileageUpload(FilePart file, boolean includeVisits) {
+        return startUpload(file)
+                .flatMap(job -> job.completion()
+                        .then(Mono.defer(() -> getUpload(job.upload().getId(), includeVisits))));
+    }
+
+    // Returns as soon as the calculation has started; poll getUpload until the status is COMPLETED or FAILED.
+    public Mono<WorkerMileageUploadResponse> startMonthlyMileageUpload(FilePart file) {
+        return startUpload(file)
+                .flatMap(job -> getUpload(job.upload().getId(), false));
+    }
+
+    private Mono<UploadJob> startUpload(FilePart file) {
         return DataBufferUtils.join(file.content())
                 .map(this::toBytes)
                 .flatMap(bytes -> {
                     String fileHash = sha256Hex(bytes);
                     return uploadRepository.findFirstByFileHashOrderByCreatedAtDesc(fileHash)
-                            .flatMap(existingUpload -> reuseCompletedUpload(existingUpload, includeVisits))
+                            .flatMap(this::reuseUpload)
                             .switchIfEmpty(Mono.defer(() -> saveUpload(file.filename(), fileHash)
-                                    .flatMap(upload -> calculateMonthlyMileageReports(bytes, upload.getId(), includeVisits)
-                                            .map(reports -> toUploadResponse(upload, reports, true))
-                                            .onErrorResume(error -> cleanupFailedUpload(upload.getId())
-                                                    .then(Mono.error(error)))
-                                            // A dropped client connection cancels instead of erroring; without this the
-                                            // half-saved upload would be returned (with no reports) on the next upload of the file.
-                                            .doOnCancel(() -> cleanupFailedUpload(upload.getId()).subscribe(
-                                                    null,
-                                                    error -> log.warn("Failed to clean up cancelled upload {}", upload.getId(), error))))));
+                                    .map(upload -> new UploadJob(upload, runUpload(upload.getId(), bytes)))));
                 });
     }
 
-    private Mono<WorkerMileageUploadResponse> reuseCompletedUpload(WorkerMileageUpload existingUpload, boolean includeVisits) {
-        return reportRepository.findByUploadIdOrderByReportMonthAsc(existingUpload.getId())
-                .hasElements()
-                .flatMap(hasReports -> {
-                    if (hasReports) {
-                        return getUpload(existingUpload.getId(), includeVisits);
-                    }
-                    log.warn("Upload {} for file {} has no reports; recalculating", existingUpload.getId(), existingUpload.getFileName());
-                    return cleanupFailedUpload(existingUpload.getId()).then(Mono.empty());
-                });
+    private Mono<UploadJob> reuseUpload(WorkerMileageUpload existingUpload) {
+        Mono<Void> running = runningUploads.get(existingUpload.getId());
+        if (running != null) {
+            return Mono.just(new UploadJob(existingUpload, running));
+        }
+
+        // Re-read after checking the running jobs: a job that just finished has already saved its final status.
+        return uploadRepository.findById(existingUpload.getId())
+                .flatMap(upload -> reportRepository.findByUploadIdOrderByReportMonthAsc(upload.getId())
+                        .hasElements()
+                        .flatMap(hasReports -> {
+                            if (hasReports && !UPLOAD_FAILED.equals(upload.getStatus()) && !UPLOAD_PROCESSING.equals(upload.getStatus())) {
+                                return Mono.just(new UploadJob(upload, Mono.empty()));
+                            }
+                            // PROCESSING without a running job means the server restarted mid-calculation.
+                            log.warn("Upload {} for file {} is {} with no running calculation; recalculating",
+                                    upload.getId(), upload.getFileName(), upload.getStatus() == null ? "missing reports" : upload.getStatus());
+                            return cleanupFailedUpload(upload.getId()).then(Mono.<UploadJob>empty());
+                        }));
+    }
+
+    private Mono<Void> runUpload(Long uploadId, byte[] bytes) {
+        Sinks.Empty<Void> done = Sinks.empty();
+        Mono<Void> completion = done.asMono();
+        runningUploads.put(uploadId, completion);
+
+        // Subscribed here rather than by the request, so a dropped connection cannot cancel it.
+        calculateMonthlyMileageReports(bytes, uploadId, false)
+                .then(updateUploadStatus(uploadId, UPLOAD_COMPLETED, null))
+                .onErrorResume(error -> reportRepository.deleteByUploadId(uploadId)
+                        .then(updateUploadStatus(uploadId, UPLOAD_FAILED, error.getMessage()))
+                        .then(Mono.error(error)))
+                .doFinally(signal -> runningUploads.remove(uploadId))
+                .subscribe(
+                        null,
+                        error -> {
+                            log.warn("Mileage upload {} failed: {}", uploadId, error.getMessage());
+                            done.tryEmitError(error);
+                        },
+                        done::tryEmitEmpty);
+        return completion;
+    }
+
+    private Mono<Void> updateUploadStatus(Long uploadId, String status, String errorMessage) {
+        return uploadRepository.findById(uploadId)
+                .flatMap(upload -> {
+                    upload.setStatus(status);
+                    upload.setErrorMessage(errorMessage == null ? null
+                            : errorMessage.substring(0, Math.min(errorMessage.length(), 2000)));
+                    return uploadRepository.save(upload);
+                })
+                .then();
     }
 
     public Flux<WorkerMileageReportResponse> listReports(String reportMonth, Integer year) {
@@ -288,6 +344,7 @@ public class MileageUploadService {
                 .fileName(fileName == null || fileName.isBlank() ? "worker-mileage-upload.xlsx" : fileName)
                 .fileHash(fileHash)
                 .createdAt(LocalDateTime.now())
+                .status(UPLOAD_PROCESSING)
                 .build());
     }
 
@@ -431,6 +488,8 @@ public class MileageUploadService {
             }
 
             return visits;
+        } catch (ExcelRuntimeException e) {
+            throw new IllegalArgumentException("The file could not be read as an Excel (.xlsx) workbook.", e);
         }
     }
 
@@ -1359,6 +1418,8 @@ public class MileageUploadService {
                 .id(upload.getId())
                 .fileName(upload.getFileName())
                 .createdAt(upload.getCreatedAt())
+                .status(upload.getStatus() == null ? UPLOAD_COMPLETED : upload.getStatus())
+                .errorMessage(upload.getErrorMessage())
                 .reportCount(reports.size())
                 .reportMonths(reportMonths)
                 .totals(toUploadedMileageTotalResponses(reports))
@@ -2107,6 +2168,9 @@ public class MileageUploadService {
         private int elements() {
             return origins.size() * destinations.size();
         }
+    }
+
+    private record UploadJob(WorkerMileageUpload upload, Mono<Void> completion) {
     }
 
     private record CachedDistance(String origin, String destination, Double distanceKm) {

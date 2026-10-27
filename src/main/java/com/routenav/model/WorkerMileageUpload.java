@@ -20,4 +20,7 @@ public class WorkerMileageUpload {
     private String fileName;
     private String fileHash;
     private LocalDateTime createdAt;
+    // PROCESSING, COMPLETED or FAILED; null for uploads saved before statuses existed (treated as COMPLETED).
+    private String status;
+    private String errorMessage;
 }

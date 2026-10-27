@@ -90,6 +90,8 @@ CREATE TABLE IF NOT EXISTS worker_mileage_uploads (
 );
 
 ALTER TABLE worker_mileage_uploads ADD COLUMN IF NOT EXISTS file_hash VARCHAR(64);
+ALTER TABLE worker_mileage_uploads ADD COLUMN IF NOT EXISTS status VARCHAR(20);
+ALTER TABLE worker_mileage_uploads ADD COLUMN IF NOT EXISTS error_message VARCHAR(2000);
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_mileage_uploads_file_hash
     ON worker_mileage_uploads (file_hash);

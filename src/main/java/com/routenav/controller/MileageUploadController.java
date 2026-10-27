@@ -39,9 +39,16 @@ public class MileageUploadController {
 
     @PostMapping(value = "/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public Mono<ResponseEntity<Object>> upload(@RequestPart("file") FilePart file,
-                                               @RequestParam(name = "includeVisits", defaultValue = "true") boolean includeVisits) {
-        return mileageUploadService.calculateMonthlyMileageUpload(file, includeVisits)
-                .map(upload -> ResponseEntity.ok((Object) upload))
+                                               @RequestParam(name = "includeVisits", defaultValue = "true") boolean includeVisits,
+                                               @RequestParam(name = "async", defaultValue = "false") boolean async) {
+        // async=true returns straight away; poll GET /uploads/{id} until status is COMPLETED or FAILED.
+        Mono<ResponseEntity<Object>> response = async
+                ? mileageUploadService.startMonthlyMileageUpload(file)
+                        .map(upload -> ResponseEntity.status("COMPLETED".equals(upload.getStatus()) ? HttpStatus.OK : HttpStatus.ACCEPTED)
+                                .body((Object) upload))
+                : mileageUploadService.calculateMonthlyMileageUpload(file, includeVisits)
+                        .map(upload -> ResponseEntity.ok((Object) upload));
+        return response
                 .onErrorResume(IllegalArgumentException.class, e -> Mono.just(ResponseEntity.badRequest()
                         .body(ErrorResponse.builder().message(e.getMessage()).build())))
                 .onErrorResume(e -> Mono.just(ResponseEntity.status(HttpStatus.BAD_GATEWAY)
