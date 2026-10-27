@@ -29,14 +29,20 @@ import java.time.YearMonth;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.HexFormat;
 import org.apache.poi.ss.usermodel.Cell;
@@ -72,9 +78,11 @@ public class MileageUploadService {
 
     private static final double KM_TO_MILES = 0.621371;
     private static final double METERS_PER_KM = 1000.0;
-    private static final int BRUTE_FORCE_LIMIT = 9;
+    private static final int EXACT_ROUTE_LIMIT = 9;
     private static final int BATCH_MAX_DIM = 25;
     private static final int BATCH_MAX_ELEM = 100;
+    private static final int ROUTE_MATRIX_CONCURRENCY = 4;
+    private static final int CACHE_QUERY_CHUNK = 500;
 
     private static final Map<String, List<String>> COLUMN_ALIASES = Map.of(
             "Carer_No", List.of("Carer_No", "Carer No", "CarerNo", "Carer Number", "Staff Number", "Staff No", "StaffNo", "Worker Number", "Worker No", "WorkerNo", "Employee No", "Employee Number"),
@@ -128,6 +136,10 @@ public class MileageUploadService {
     private final Duration routeMatrixBatchDelay;
 
     private final int routeMatrixElementsPerMinute;
+
+    private final Object routeMatrixQuotaLock = new Object();
+
+    private long routeMatrixNextSlotNanos = System.nanoTime();
 
     public MileageUploadService(GeocodingService geocodingService,
                                 RoutingService routingService,
@@ -561,10 +573,16 @@ public class MileageUploadService {
             visitsByShift.computeIfAbsent(new ShiftKey(visit.staffNumber(), visit.visitDate(), visit.shift()), ignored -> new ArrayList<>()).add(visit);
         }
 
-        return Flux.fromIterable(visitsByShift.entrySet())
-                .concatMap(entry -> analyseShift(entry.getKey(), entry.getValue()))
-                .collectList()
-                .map(shiftResults -> toAnalysisResult(orderedVisits, shiftResults));
+        // Resolve every distance the month needs up front, then optimise each shift in memory.
+        return loadShiftDistances(visitsByShift.values())
+                .publishOn(Schedulers.boundedElastic())
+                .map(cache -> {
+                    List<ShiftResult> shiftResults = new ArrayList<>();
+                    for (Map.Entry<ShiftKey, List<VisitRow>> entry : visitsByShift.entrySet()) {
+                        shiftResults.add(analyseShift(entry.getKey(), entry.getValue(), cache));
+                    }
+                    return toAnalysisResult(orderedVisits, shiftResults);
+                });
     }
 
     private AnalysisResult toAnalysisResult(List<VisitRow> orderedVisits, List<ShiftResult> shifts) {
@@ -580,128 +598,190 @@ public class MileageUploadService {
         return new AnalysisResult(orderedVisits, new ArrayList<>(rowsByStaff.values()), shifts);
     }
 
-    private Mono<ShiftResult> analyseShift(ShiftKey key, List<VisitRow> visits) {
+    private ShiftResult analyseShift(ShiftKey key, List<VisitRow> visits, Map<String, Map<String, Double>> cache) {
         List<String> addresses = visits.stream().map(VisitRow::address).toList();
         if (addresses.size() < 2) {
-            return Mono.just(new ShiftResult(key, visits, visits, 0.0, 0.0, 0.0, List.of(), List.of()));
+            return new ShiftResult(key, visits, visits, 0.0, 0.0, 0.0, List.of(), List.of());
         }
 
-        return distanceMatrix(addresses)
-                .map(matrix -> {
-                    List<Double> originalLegs = new ArrayList<>();
-                    for (int i = 0; i < addresses.size() - 1; i++) {
-                        originalLegs.add(matrix[i][i + 1]);
-                    }
-                    double originalKm = originalLegs.stream().mapToDouble(Double::doubleValue).sum();
-                    List<Integer> optIndexes = optimisedIndexes(matrix);
-                    List<VisitRow> optimisedVisits = optIndexes.stream().map(visits::get).toList();
-                    List<Double> optimisedLegs = new ArrayList<>();
-                    for (int i = 0; i < optIndexes.size() - 1; i++) {
-                        optimisedLegs.add(matrix[optIndexes.get(i)][optIndexes.get(i + 1)]);
-                    }
-                    double optimisedKm = optimisedLegs.stream().mapToDouble(Double::doubleValue).sum();
-                    return new ShiftResult(key, visits, optimisedVisits, originalKm, optimisedKm, originalKm - optimisedKm, originalLegs, optimisedLegs);
-                });
+        double[][] matrix = distanceMatrix(addresses, cache);
+        List<Double> originalLegs = new ArrayList<>();
+        for (int i = 0; i < addresses.size() - 1; i++) {
+            originalLegs.add(matrix[i][i + 1]);
+        }
+        double originalKm = originalLegs.stream().mapToDouble(Double::doubleValue).sum();
+        List<Integer> optIndexes = optimisedIndexes(matrix);
+        List<VisitRow> optimisedVisits = optIndexes.stream().map(visits::get).toList();
+        List<Double> optimisedLegs = new ArrayList<>();
+        for (int i = 0; i < optIndexes.size() - 1; i++) {
+            optimisedLegs.add(matrix[optIndexes.get(i)][optIndexes.get(i + 1)]);
+        }
+        double optimisedKm = optimisedLegs.stream().mapToDouble(Double::doubleValue).sum();
+        return new ShiftResult(key, visits, optimisedVisits, originalKm, optimisedKm, originalKm - optimisedKm, originalLegs, optimisedLegs);
     }
 
-    private Mono<double[][]> distanceMatrix(List<String> addresses) {
-        int size = addresses.size();
-        double[][] distances = new double[size][size];
+    private double[][] distanceMatrix(List<String> addresses, Map<String, Map<String, Double>> cache) {
+        double[][] distances = new double[addresses.size()][addresses.size()];
+        copyCachedDistances(distances, addresses, cache);
+        return distances;
+    }
 
+    private Mono<Map<String, Map<String, Double>>> loadShiftDistances(Collection<List<VisitRow>> shifts) {
         Map<String, String> addressByKey = new LinkedHashMap<>();
-        for (String address : addresses) {
-            String key = normalizeCacheAddress(address);
-            if (StringUtils.hasText(key)) {
-                addressByKey.putIfAbsent(key, address);
+        List<List<String>> shiftKeys = new ArrayList<>();
+        for (List<VisitRow> shift : shifts) {
+            Set<String> keys = new LinkedHashSet<>();
+            for (VisitRow visit : shift) {
+                String key = normalizeCacheAddress(visit.address());
+                if (StringUtils.hasText(key)) {
+                    addressByKey.putIfAbsent(key, visit.address());
+                    keys.add(key);
+                }
+            }
+            if (keys.size() >= 2) {
+                shiftKeys.add(new ArrayList<>(keys));
             }
         }
-        List<String> uniqueKeys = new ArrayList<>(addressByKey.keySet());
 
-        if (uniqueKeys.size() < 2) {
-            return Mono.just(distances);
-        }
-
-        return loadCachedDistances(uniqueKeys)
-                .flatMap(cache -> fetchMissingDistanceBatches(uniqueKeys, addressByKey, cache)
-                        .then(Mono.fromCallable(() -> {
-                            copyCachedDistances(distances, addresses, cache);
-                            return distances;
-                        })));
+        return loadCachedDistances(addressByKey.keySet())
+                .flatMap(cache -> fetchMissingDistances(planMissingDistanceBatches(shiftKeys, cache), addressByKey)
+                        .doOnNext(entry -> cache.computeIfAbsent(entry.origin(), ignored -> new HashMap<>())
+                                .put(entry.destination(), entry.distanceKm()))
+                        .then(Mono.just(cache)));
     }
 
-    private Mono<Map<String, Map<String, Double>>> loadCachedDistances(List<String> addressKeys) {
+    private Mono<Map<String, Map<String, Double>>> loadCachedDistances(Set<String> addressKeys) {
         Map<String, Map<String, Double>> cache = new HashMap<>();
         return Flux.fromIterable(addressKeys)
-                .concatMap(origin -> databaseClient.sql("""
-                                SELECT destination_address, distance_km
+                .buffer(CACHE_QUERY_CHUNK)
+                .concatMap(origins -> databaseClient.sql("""
+                                SELECT origin_address, destination_address, distance_km
                                 FROM route_distance_cache
-                                WHERE origin_address = :origin
+                                WHERE origin_address IN (:origins)
                                 """)
-                        .bind("origin", origin)
-                        .map((row, metadata) -> Map.entry(
+                        .bind("origins", origins)
+                        .map((row, metadata) -> new CachedDistance(
+                                row.get("origin_address", String.class),
                                 row.get("destination_address", String.class),
                                 row.get("distance_km", Double.class)))
-                        .all()
-                        .doOnNext(entry -> {
-                            if (entry.getKey() != null && entry.getValue() != null && addressKeys.contains(entry.getKey())) {
-                                cache.computeIfAbsent(origin, ignored -> new HashMap<>())
-                                        .put(entry.getKey(), entry.getValue());
-                            }
-                        }))
+                        .all())
+                .filter(entry -> entry.destination() != null && entry.distanceKm() != null && addressKeys.contains(entry.destination()))
+                .doOnNext(entry -> cache.computeIfAbsent(entry.origin(), ignored -> new HashMap<>())
+                        .put(entry.destination(), entry.distanceKm()))
                 .then(Mono.just(cache));
     }
 
-    private Mono<Void> fetchMissingDistanceBatches(List<String> uniqueKeys, Map<String, String> addressByKey,
-                                                   Map<String, Map<String, Double>> cache) {
-        List<String> originsNeedingFetch = uniqueKeys.stream()
-                .filter(origin -> uniqueKeys.stream()
-                        .anyMatch(destination -> !origin.equals(destination) && !hasCachedDistance(cache, origin, destination)))
-                .toList();
-
-        if (originsNeedingFetch.isEmpty()) {
-            return Mono.empty();
-        }
-
+    // Only pairs inside a shift are needed. For each shift, pick a small set of addresses that touches every
+    // missing pair and request just those rows and columns, so mostly-cached shifts cost a few elements, not n x n.
+    private List<MatrixBatch> planMissingDistanceBatches(List<List<String>> shiftKeys, Map<String, Map<String, Double>> cache) {
+        Set<String> planned = new HashSet<>();
         List<MatrixBatch> batches = new ArrayList<>();
-        for (int dStart = 0; dStart < uniqueKeys.size(); dStart += BATCH_MAX_DIM) {
-            int dEnd = Math.min(uniqueKeys.size(), dStart + BATCH_MAX_DIM);
-            int destinationCount = dEnd - dStart;
-            int maxOrigins = Math.max(1, Math.min(BATCH_MAX_DIM, BATCH_MAX_ELEM / destinationCount));
-            for (int oStart = 0; oStart < originsNeedingFetch.size(); oStart += maxOrigins) {
-                int oEnd = Math.min(originsNeedingFetch.size(), oStart + maxOrigins);
-                batches.add(new MatrixBatch(oStart, oEnd, dStart, dEnd));
+        for (List<String> keys : shiftKeys) {
+            Map<String, Set<String>> missingByOrigin = new HashMap<>();
+            for (String origin : keys) {
+                for (String destination : keys) {
+                    if (!origin.equals(destination) && !hasCachedDistance(cache, origin, destination)
+                            && !planned.contains(pairKey(origin, destination))) {
+                        missingByOrigin.computeIfAbsent(origin, ignored -> new HashSet<>()).add(destination);
+                    }
+                }
             }
-        }
+            if (missingByOrigin.isEmpty()) {
+                continue;
+            }
 
-        return Flux.fromIterable(batches)
-                .concatMap(batch -> Mono.delay(batchDelay(batch))
-                        .then(fetchDistanceBatch(uniqueKeys, originsNeedingFetch, addressByKey, batch))
-                        .flatMapMany(responses -> saveDistanceBatch(uniqueKeys, originsNeedingFetch, cache, batch, responses)))
-                .then();
+            List<String> cover = missingPairCover(keys, missingByOrigin);
+            List<String> others = keys.stream().filter(key -> !cover.contains(key)).toList();
+            addMatrixBatches(batches, planned, cover, keys);
+            addMatrixBatches(batches, planned, others, cover);
+        }
+        return batches;
     }
 
-    // Google bills and rate-limits the matrix per element (origins x destinations), so space batches by their size.
-    private Duration batchDelay(MatrixBatch batch) {
-        long elements = (long) (batch.originEnd() - batch.originStart()) * (batch.destinationEnd() - batch.destinationStart());
-        Duration quotaDelay = Duration.ofMillis(elements * 60_000L / routeMatrixElementsPerMinute);
-        return quotaDelay.compareTo(routeMatrixBatchDelay) > 0 ? quotaDelay : routeMatrixBatchDelay;
+    private List<String> missingPairCover(List<String> keys, Map<String, Set<String>> missingByOrigin) {
+        List<String> cover = new ArrayList<>();
+        while (!missingByOrigin.isEmpty()) {
+            String best = null;
+            int bestCount = 0;
+            for (String key : keys) {
+                int count = missingByOrigin.getOrDefault(key, Set.of()).size();
+                for (Set<String> destinations : missingByOrigin.values()) {
+                    if (destinations.contains(key)) {
+                        count++;
+                    }
+                }
+                if (count > bestCount) {
+                    best = key;
+                    bestCount = count;
+                }
+            }
+            String chosen = best;
+            cover.add(chosen);
+            missingByOrigin.remove(chosen);
+            missingByOrigin.values().forEach(destinations -> destinations.remove(chosen));
+            missingByOrigin.values().removeIf(Set::isEmpty);
+        }
+        return cover;
+    }
+
+    private void addMatrixBatches(List<MatrixBatch> batches, Set<String> planned, List<String> origins, List<String> destinations) {
+        if (origins.isEmpty() || destinations.isEmpty()) {
+            return;
+        }
+        for (int dStart = 0; dStart < destinations.size(); dStart += BATCH_MAX_DIM) {
+            List<String> destinationChunk = destinations.subList(dStart, Math.min(destinations.size(), dStart + BATCH_MAX_DIM));
+            int maxOrigins = Math.max(1, Math.min(BATCH_MAX_DIM, BATCH_MAX_ELEM / destinationChunk.size()));
+            for (int oStart = 0; oStart < origins.size(); oStart += maxOrigins) {
+                List<String> originChunk = origins.subList(oStart, Math.min(origins.size(), oStart + maxOrigins));
+                batches.add(new MatrixBatch(List.copyOf(originChunk), List.copyOf(destinationChunk)));
+                for (String origin : originChunk) {
+                    for (String destination : destinationChunk) {
+                        planned.add(pairKey(origin, destination));
+                    }
+                }
+            }
+        }
+    }
+
+    private String pairKey(String origin, String destination) {
+        return origin + '\u0000' + destination;
+    }
+
+    private Flux<CachedDistance> fetchMissingDistances(List<MatrixBatch> batches, Map<String, String> addressByKey) {
+        if (!batches.isEmpty()) {
+            log.info("Fetching {} Google route matrix batches ({} elements)", batches.size(),
+                    batches.stream().mapToInt(MatrixBatch::elements).sum());
+        }
+        return Flux.fromIterable(batches)
+                .flatMap(batch -> Mono.delay(reserveRouteMatrixQuota(batch))
+                        .then(fetchDistanceBatch(addressByKey, batch))
+                        .flatMapMany(responses -> saveDistanceBatch(batch, responses)), ROUTE_MATRIX_CONCURRENCY);
+    }
+
+    // Google bills and rate-limits the matrix per element (origins x destinations). Batches share one timeline
+    // across concurrent uploads, so request latency overlaps the quota wait instead of adding to it.
+    private Duration reserveRouteMatrixQuota(MatrixBatch batch) {
+        long quotaNanos = Math.max(batch.elements() * 60_000_000_000L / routeMatrixElementsPerMinute, routeMatrixBatchDelay.toNanos());
+        synchronized (routeMatrixQuotaLock) {
+            long now = System.nanoTime();
+            long start = Math.max(now, routeMatrixNextSlotNanos);
+            routeMatrixNextSlotNanos = start + quotaNanos;
+            return Duration.ofNanos(start - now);
+        }
     }
 
     private boolean hasCachedDistance(Map<String, Map<String, Double>> cache, String origin, String destination) {
         return cache.getOrDefault(origin, Map.of()).containsKey(destination);
     }
 
-    private Mono<List<GoogleDistanceMatrixResponse>> fetchDistanceBatch(List<String> uniqueKeys,
-                                                                        List<String> originsNeedingFetch,
-                                                                        Map<String, String> addressByKey,
-                                                                        MatrixBatch batch) {
+    private Mono<List<GoogleDistanceMatrixResponse>> fetchDistanceBatch(Map<String, String> addressByKey, MatrixBatch batch) {
         return googleRoutesClient.post()
                 .uri(uriBuilder -> uriBuilder
                         .path("/distanceMatrix/v2:computeRouteMatrix")
                         .build())
                 .header("X-Goog-Api-Key", requireGoogleApiKey())
                 .header("X-Goog-FieldMask", "originIndex,destinationIndex,status,condition,distanceMeters")
-                .bodyValue(buildGoogleRouteMatrixRequest(uniqueKeys, originsNeedingFetch, addressByKey, batch))
+                .bodyValue(buildGoogleRouteMatrixRequest(addressByKey, batch))
                 .retrieve()
                 .onStatus(HttpStatusCode::isError, response -> response.bodyToMono(String.class)
                         .defaultIfEmpty("")
@@ -737,16 +817,13 @@ public class MileageUploadService {
         return new IllegalStateException(message);
     }
 
-    private Map<String, Object> buildGoogleRouteMatrixRequest(List<String> uniqueKeys,
-                                                              List<String> originsNeedingFetch,
-                                                              Map<String, String> addressByKey,
-                                                              MatrixBatch batch) {
+    private Map<String, Object> buildGoogleRouteMatrixRequest(Map<String, String> addressByKey, MatrixBatch batch) {
         return Map.of(
-                "origins", originsNeedingFetch.subList(batch.originStart(), batch.originEnd()).stream()
+                "origins", batch.origins().stream()
                         .map(addressByKey::get)
                         .map(this::routeMatrixWaypoint)
                         .toList(),
-                "destinations", uniqueKeys.subList(batch.destinationStart(), batch.destinationEnd()).stream()
+                "destinations", batch.destinations().stream()
                         .map(addressByKey::get)
                         .map(this::routeMatrixWaypoint)
                         .toList(),
@@ -758,47 +835,49 @@ public class MileageUploadService {
         return Map.of("waypoint", Map.of("address", address));
     }
 
-    private Flux<Void> saveDistanceBatch(List<String> uniqueKeys,
-                                         List<String> originsNeedingFetch,
-                                         Map<String, Map<String, Double>> cache,
-                                         MatrixBatch batch,
-                                         List<GoogleDistanceMatrixResponse> responses) {
+    private Flux<CachedDistance> saveDistanceBatch(MatrixBatch batch, List<GoogleDistanceMatrixResponse> responses) {
         if (responses == null) {
             return Flux.error(new IllegalStateException("Google Routes Matrix returned an empty response."));
         }
 
-        return Flux.fromIterable(responses)
+        List<CachedDistance> distances = responses.stream()
                 .filter(response -> response != null
                         && response.getOriginIndex() != null
                         && response.getDestinationIndex() != null
                         && "ROUTE_EXISTS".equals(response.getCondition())
                         && response.getDistanceMeters() != null)
-                .concatMap(response -> {
-                    String origin = originsNeedingFetch.get(batch.originStart() + response.getOriginIndex());
-                    String destination = uniqueKeys.get(batch.destinationStart() + response.getDestinationIndex());
-                    if (origin.equals(destination)) {
-                        return Mono.empty();
-                    }
+                .map(response -> new CachedDistance(
+                        batch.origins().get(response.getOriginIndex()),
+                        batch.destinations().get(response.getDestinationIndex()),
+                        response.getDistanceMeters() / METERS_PER_KM))
+                .filter(distance -> !distance.origin().equals(distance.destination()))
+                .toList();
 
-                    double distanceKm = response.getDistanceMeters() / METERS_PER_KM;
-                    cache.computeIfAbsent(origin, ignored -> new HashMap<>()).put(destination, distanceKm);
-                    return saveCachedDistance(origin, destination, distanceKm);
-                });
+        return saveCachedDistances(distances).thenMany(Flux.fromIterable(distances));
     }
 
-    private Mono<Void> saveCachedDistance(String origin, String destination, double distanceKm) {
-        return databaseClient.sql("""
-                        INSERT INTO route_distance_cache (origin_address, destination_address, distance_km, updated_at)
-                        VALUES (:origin, :destination, :distanceKm, NOW())
-                        ON CONFLICT (origin_address, destination_address)
-                        DO UPDATE SET distance_km = EXCLUDED.distance_km, updated_at = NOW()
-                        """)
-                .bind("origin", origin)
-                .bind("destination", destination)
-                .bind("distanceKm", distanceKm)
-                .fetch()
-                .rowsUpdated()
-                .then();
+    private Mono<Void> saveCachedDistances(List<CachedDistance> distances) {
+        if (distances.isEmpty()) {
+            return Mono.empty();
+        }
+
+        StringBuilder sql = new StringBuilder("INSERT INTO route_distance_cache (origin_address, destination_address, distance_km, updated_at) VALUES ");
+        for (int i = 0; i < distances.size(); i++) {
+            sql.append(i == 0 ? "" : ", ").append("(:o").append(i).append(", :d").append(i).append(", :k").append(i).append(", NOW())");
+        }
+        sql.append("""
+                 ON CONFLICT (origin_address, destination_address)
+                DO UPDATE SET distance_km = EXCLUDED.distance_km, updated_at = NOW()
+                """);
+
+        DatabaseClient.GenericExecuteSpec spec = databaseClient.sql(sql.toString());
+        for (int i = 0; i < distances.size(); i++) {
+            CachedDistance distance = distances.get(i);
+            spec = spec.bind("o" + i, distance.origin())
+                    .bind("d" + i, distance.destination())
+                    .bind("k" + i, distance.distanceKm());
+        }
+        return spec.fetch().rowsUpdated().then();
     }
 
     private void copyCachedDistances(double[][] distances, List<String> addresses, Map<String, Map<String, Double>> cache) {
@@ -827,32 +906,59 @@ public class MileageUploadService {
     }
 
     private List<Integer> optimisedIndexes(double[][] matrix) {
-        int n = matrix.length;
-        if (n <= BRUTE_FORCE_LIMIT) {
-            BestPath best = new BestPath(null, Double.MAX_VALUE);
-            permute(new ArrayList<>(), n, new boolean[n], matrix, best);
-            return best.path();
+        if (matrix.length <= EXACT_ROUTE_LIMIT) {
+            return shortestPathExact(matrix);
         }
         return nearestNeighbourThenTwoOpt(matrix);
     }
 
-    private void permute(List<Integer> path, int n, boolean[] used, double[][] matrix, BestPath best) {
-        if (path.size() == n) {
-            double total = pathCost(path, matrix);
-            if (total < best.total()) {
-                best.replace(new ArrayList<>(path), total);
-            }
-            return;
+    // Held-Karp: exact shortest open path over all visits, O(n^2 * 2^n) instead of trying all n! orders.
+    private List<Integer> shortestPathExact(double[][] matrix) {
+        int n = matrix.length;
+        int full = (1 << n) - 1;
+        double[][] cost = new double[full + 1][n];
+        int[][] previous = new int[full + 1][n];
+        for (double[] row : cost) {
+            Arrays.fill(row, Double.MAX_VALUE);
         }
         for (int i = 0; i < n; i++) {
-            if (!used[i]) {
-                used[i] = true;
-                path.add(i);
-                permute(path, n, used, matrix, best);
-                path.remove(path.size() - 1);
-                used[i] = false;
+            cost[1 << i][i] = 0.0;
+            previous[1 << i][i] = -1;
+        }
+        for (int mask = 1; mask <= full; mask++) {
+            for (int last = 0; last < n; last++) {
+                if ((mask & (1 << last)) == 0 || cost[mask][last] == Double.MAX_VALUE) {
+                    continue;
+                }
+                for (int next = 0; next < n; next++) {
+                    if ((mask & (1 << next)) != 0) {
+                        continue;
+                    }
+                    int nextMask = mask | (1 << next);
+                    double candidate = cost[mask][last] + matrix[last][next];
+                    if (candidate < cost[nextMask][next]) {
+                        cost[nextMask][next] = candidate;
+                        previous[nextMask][next] = last;
+                    }
+                }
             }
         }
+
+        int last = 0;
+        for (int i = 1; i < n; i++) {
+            if (cost[full][i] < cost[full][last]) {
+                last = i;
+            }
+        }
+        List<Integer> path = new ArrayList<>();
+        for (int mask = full; last != -1; ) {
+            path.add(last);
+            int prior = previous[mask][last];
+            mask &= ~(1 << last);
+            last = prior;
+        }
+        Collections.reverse(path);
+        return path;
     }
 
     private List<Integer> nearestNeighbourThenTwoOpt(double[][] matrix) {
@@ -1962,7 +2068,13 @@ public class MileageUploadService {
     private record AnalysisResult(List<VisitRow> visits, List<MileageResult> rows, List<ShiftResult> shifts) {
     }
 
-    private record MatrixBatch(int originStart, int originEnd, int destinationStart, int destinationEnd) {
+    private record MatrixBatch(List<String> origins, List<String> destinations) {
+        private int elements() {
+            return origins.size() * destinations.size();
+        }
+    }
+
+    private record CachedDistance(String origin, String destination, Double distanceKm) {
     }
 
     private static class GoogleRoutesMatrixRateLimitException extends RuntimeException {
@@ -2033,30 +2145,6 @@ public class MileageUploadService {
 
         private List<String> sessions() {
             return sessions;
-        }
-    }
-
-    private static class BestPath {
-
-        private List<Integer> path;
-        private double total;
-
-        private BestPath(List<Integer> path, double total) {
-            this.path = path;
-            this.total = total;
-        }
-
-        private List<Integer> path() {
-            return path == null ? List.of() : path;
-        }
-
-        private double total() {
-            return total;
-        }
-
-        private void replace(List<Integer> path, double total) {
-            this.path = path;
-            this.total = total;
         }
     }
 }
