@@ -32,6 +32,7 @@ google:
   routes-base-url: https://routes.googleapis.com
   geocoding-base-url: https://maps.googleapis.com
   route-matrix-batch-delay-ms: ${GOOGLE_ROUTE_MATRIX_BATCH_DELAY_MS:5}
+  route-matrix-elements-per-minute: ${GOOGLE_ROUTE_MATRIX_ELEMENTS_PER_MINUTE:2500}
 
   security:
     user:

@@ -47,6 +47,8 @@ import org.apache.poi.ss.usermodel.Row;
 import org.apache.poi.ss.usermodel.Sheet;
 import org.apache.poi.ss.usermodel.Workbook;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.core.io.buffer.DataBufferUtils;
 import org.springframework.http.codec.multipart.FilePart;
@@ -65,6 +67,8 @@ import reactor.util.retry.Retry;
 
 @Service
 public class MileageUploadService {
+
+    private static final Logger log = LoggerFactory.getLogger(MileageUploadService.class);
 
     private static final double KM_TO_MILES = 0.621371;
     private static final double METERS_PER_KM = 1000.0;
@@ -88,14 +92,19 @@ public class MileageUploadService {
             DateTimeFormatter.ofPattern("d/M/yyyy"),
             DateTimeFormatter.ofPattern("M/d/yyyy"),
             DateTimeFormatter.ofPattern("d-M-yyyy"),
-            DateTimeFormatter.ofPattern("M-d-yyyy")
+            DateTimeFormatter.ofPattern("M-d-yyyy"),
+            DateTimeFormatter.ofPattern("d/M/yy"),
+            DateTimeFormatter.ofPattern("M/d/yy"),
+            DateTimeFormatter.ofPattern("d-M-yy"),
+            DateTimeFormatter.ofPattern("M-d-yy")
     );
 
     private static final List<DateTimeFormatter> TIME_FORMATTERS = List.of(
             DateTimeFormatter.ofPattern("H:mm"),
             DateTimeFormatter.ofPattern("H:mm:ss"),
             DateTimeFormatter.ofPattern("h:mm a", Locale.ENGLISH),
-            DateTimeFormatter.ofPattern("h:mm:ss a", Locale.ENGLISH)
+            DateTimeFormatter.ofPattern("h:mm:ss a", Locale.ENGLISH),
+            DateTimeFormatter.ofPattern("h:mma", Locale.ENGLISH)
     );
 
     private final GeocodingService geocodingService;
@@ -118,6 +127,8 @@ public class MileageUploadService {
 
     private final Duration routeMatrixBatchDelay;
 
+    private final int routeMatrixElementsPerMinute;
+
     public MileageUploadService(GeocodingService geocodingService,
                                 RoutingService routingService,
                                 WorkerMileageReportRepository reportRepository,
@@ -127,7 +138,8 @@ public class MileageUploadService {
                                 DatabaseClient databaseClient,
                                 @Qualifier("googleRoutesClient") WebClient googleRoutesClient,
                                 @Value("${google.api-key}") String googleApiKey,
-                                @Value("${google.route-matrix-batch-delay-ms:1000}") long routeMatrixBatchDelayMs) {
+                                @Value("${google.route-matrix-batch-delay-ms:1000}") long routeMatrixBatchDelayMs,
+                                @Value("${google.route-matrix-elements-per-minute:2500}") int routeMatrixElementsPerMinute) {
         this.geocodingService = geocodingService;
         this.routingService = routingService;
         this.reportRepository = reportRepository;
@@ -138,6 +150,7 @@ public class MileageUploadService {
         this.googleRoutesClient = googleRoutesClient;
         this.googleApiKey = googleApiKey;
         this.routeMatrixBatchDelay = Duration.ofMillis(Math.max(0, routeMatrixBatchDelayMs));
+        this.routeMatrixElementsPerMinute = Math.max(1, routeMatrixElementsPerMinute);
     }
 
     public Mono<List<WorkerMileageReportResponse>> calculateMonthlyMileageReports(FilePart file) {
@@ -176,12 +189,29 @@ public class MileageUploadService {
                 .flatMap(bytes -> {
                     String fileHash = sha256Hex(bytes);
                     return uploadRepository.findFirstByFileHashOrderByCreatedAtDesc(fileHash)
-                            .flatMap(existingUpload -> getUpload(existingUpload.getId(), includeVisits))
-                            .switchIfEmpty(saveUpload(file.filename(), fileHash)
+                            .flatMap(existingUpload -> reuseCompletedUpload(existingUpload, includeVisits))
+                            .switchIfEmpty(Mono.defer(() -> saveUpload(file.filename(), fileHash)
                                     .flatMap(upload -> calculateMonthlyMileageReports(bytes, upload.getId(), includeVisits)
                                             .map(reports -> toUploadResponse(upload, reports, true))
                                             .onErrorResume(error -> cleanupFailedUpload(upload.getId())
-                                                    .then(Mono.error(error)))));
+                                                    .then(Mono.error(error)))
+                                            // A dropped client connection cancels instead of erroring; without this the
+                                            // half-saved upload would be returned (with no reports) on the next upload of the file.
+                                            .doOnCancel(() -> cleanupFailedUpload(upload.getId()).subscribe(
+                                                    null,
+                                                    error -> log.warn("Failed to clean up cancelled upload {}", upload.getId(), error))))));
+                });
+    }
+
+    private Mono<WorkerMileageUploadResponse> reuseCompletedUpload(WorkerMileageUpload existingUpload, boolean includeVisits) {
+        return reportRepository.findByUploadIdOrderByReportMonthAsc(existingUpload.getId())
+                .hasElements()
+                .flatMap(hasReports -> {
+                    if (hasReports) {
+                        return getUpload(existingUpload.getId(), includeVisits);
+                    }
+                    log.warn("Upload {} for file {} has no reports; recalculating", existingUpload.getId(), existingUpload.getFileName());
+                    return cleanupFailedUpload(existingUpload.getId()).then(Mono.empty());
                 });
     }
 
@@ -338,6 +368,7 @@ public class MileageUploadService {
             DataFormatter formatter = new DataFormatter();
             Map<String, Integer> columns = findColumns(header, formatter);
             List<VisitRow> visits = new ArrayList<>();
+            List<String> skippedRows = new ArrayList<>();
 
             for (int i = header.getRowNum() + 1; i <= sheet.getLastRowNum(); i++) {
                 Row row = sheet.getRow(i);
@@ -345,25 +376,38 @@ public class MileageUploadService {
                     continue;
                 }
 
+                // Excel row numbers are 1-based.
+                int excelRow = i + 1;
                 String staffNumber = getText(row, columns.get("Carer_No"), formatter);
                 String address = getText(row, columns.get("Client Address"), formatter);
-                LocalDate date = parseDate(row.getCell(columns.get("Date_of_Call")), formatter);
-                TimeRange visitTime = parseTimeRange(row.getCell(columns.get("Time_of_Call")), formatter);
-                if (visitTime == null || visitTime.startTime() == null) {
+                if (staffNumber.isBlank() || address.isBlank()) {
+                    skippedRows.add("Row " + excelRow + ": staff number and address are required.");
+                    continue;
+                }
+
+                LocalDate date;
+                TimeRange visitTime;
+                try {
+                    date = parseDate(row.getCell(columns.get("Date_of_Call")), formatter);
+                    visitTime = parseTimeRange(row.getCell(columns.get("Time_of_Call")), formatter);
+                } catch (IllegalArgumentException e) {
+                    skippedRows.add("Row " + excelRow + ": " + e.getMessage());
                     continue;
                 }
                 String name = columns.containsKey("Name") ? getText(row, columns.get("Name"), formatter) : "";
                 String shift = columns.containsKey("Shifts") ? normalizeShift(getText(row, columns.get("Shifts"), formatter), visitTime.startTime()) : shiftForTime(visitTime.startTime());
 
-                if (staffNumber.isBlank() || address.isBlank()) {
-                    continue;
-                }
-
                 visits.add(new VisitRow(staffNumber, LocalDateTime.of(date, visitTime.startTime()), date, visitTime.startTime(), visitTime.endTime(), address, name, shift, null, null));
             }
 
+            if (!skippedRows.isEmpty()) {
+                log.warn("Skipped {} invalid row(s) in mileage upload: {}", skippedRows.size(),
+                        String.join(" ", skippedRows.subList(0, Math.min(20, skippedRows.size()))));
+            }
+
             if (visits.isEmpty()) {
-                throw new IllegalArgumentException("No visit rows were found in the Excel file.");
+                String reason = skippedRows.isEmpty() ? "" : " First problem: " + skippedRows.get(0);
+                throw new IllegalArgumentException("No valid visit rows were found in the Excel file." + reason);
             }
 
             return visits;
@@ -429,6 +473,9 @@ public class MileageUploadService {
         }
 
         String value = formatter.formatCellValue(cell).trim();
+        if (value.isBlank()) {
+            throw new IllegalArgumentException("Date is required.");
+        }
         for (DateTimeFormatter dateFormatter : DATE_FORMATTERS) {
             try {
                 return LocalDate.parse(value, dateFormatter);
@@ -457,19 +504,16 @@ public class MileageUploadService {
         }
 
         String value = formatter.formatCellValue(cell).trim().toUpperCase(Locale.ENGLISH);
+        if (value.isBlank()) {
+            throw new IllegalArgumentException("Visit Time is required.");
+        }
+        // Accept either a single time ("08:00") or a range ("08:00 - 08:30").
         String[] parts = value.split("\\s*-\\s*", 2);
-        if (parts.length != 2) {
-            return null;
-        }
-        try {
-            LocalTime startTime = parseTimeText(parts[0].trim(), value);
-            LocalTime endTime = !parts[1].trim().isBlank()
-                    ? parseTimeText(parts[1].trim(), value)
-                    : null;
-            return new TimeRange(startTime, endTime);
-        } catch (IllegalArgumentException ignored) {
-            return null;
-        }
+        LocalTime startTime = parseTimeText(parts[0].trim(), value);
+        LocalTime endTime = parts.length == 2 && !parts[1].trim().isBlank()
+                ? parseTimeText(parts[1].trim(), value)
+                : null;
+        return new TimeRange(startTime, endTime);
     }
 
     private LocalTime parseTimeText(String value, String originalValue) {
@@ -630,10 +674,17 @@ public class MileageUploadService {
         }
 
         return Flux.fromIterable(batches)
-                .concatMap(batch -> Mono.delay(routeMatrixBatchDelay)
+                .concatMap(batch -> Mono.delay(batchDelay(batch))
                         .then(fetchDistanceBatch(uniqueKeys, originsNeedingFetch, addressByKey, batch))
                         .flatMapMany(responses -> saveDistanceBatch(uniqueKeys, originsNeedingFetch, cache, batch, responses)))
                 .then();
+    }
+
+    // Google bills and rate-limits the matrix per element (origins x destinations), so space batches by their size.
+    private Duration batchDelay(MatrixBatch batch) {
+        long elements = (long) (batch.originEnd() - batch.originStart()) * (batch.destinationEnd() - batch.destinationStart());
+        Duration quotaDelay = Duration.ofMillis(elements * 60_000L / routeMatrixElementsPerMinute);
+        return quotaDelay.compareTo(routeMatrixBatchDelay) > 0 ? quotaDelay : routeMatrixBatchDelay;
     }
 
     private boolean hasCachedDistance(Map<String, Map<String, Double>> cache, String origin, String destination) {
