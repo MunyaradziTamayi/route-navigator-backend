@@ -194,8 +194,72 @@ public class MileageUploadService {
                 .concatMap(entry -> calculateMileage(entry.getValue())
                         .flatMap(analysis -> Mono.fromCallable(() -> buildWorkbook(analysis))
                                 .subscribeOn(Schedulers.boundedElastic())
-                                .flatMap(workbook -> saveReport(uploadId, reportMonth(entry.getKey()), optimisedVisits(analysis), analysis.rows(), workbook, includeVisits))))
+                                .flatMap(workbook -> saveReport(uploadId, reportMonth(entry.getKey()), optimisedVisits(analysis), analysis.rows(), workbook, includeVisits))
+                                .flatMap(report -> logMileageResults(uploadId, reportMonth(entry.getKey()), analysis).thenReturn(report))))
                 .collectList();
+    }
+
+    // Logs each carer's monthly totals so results show in the server logs. Straight-line miles follow the uploaded
+    // visit order within each shift; logging problems never fail the upload.
+    private Mono<Void> logMileageResults(Long uploadId, String reportMonth, AnalysisResult analysis) {
+        return Flux.fromIterable(analysis.visits())
+                .map(VisitRow::address)
+                .filter(StringUtils::hasText)
+                .distinct()
+                .flatMap(address -> geocodingService.geocodeFirst(address)
+                        .filter(response -> response.getLat() != null && response.getLon() != null)
+                        .map(response -> Map.entry(address, new Location(response.getLat(), response.getLon())))
+                        .onErrorResume(error -> Mono.empty()), 4)
+                .collectMap(Map.Entry::getKey, Map.Entry::getValue)
+                .doOnNext(locations -> {
+                    Map<String, Double> straightLineKmByStaff = new HashMap<>();
+                    for (ShiftResult shift : analysis.shifts()) {
+                        straightLineKmByStaff.merge(shift.key().staffNumber(), straightLineShiftKm(shift.originalVisits(), locations), Double::sum);
+                    }
+
+                    double totalOriginalKm = 0.0;
+                    double totalOptimisedKm = 0.0;
+                    double totalStraightLineKm = 0.0;
+                    for (MileageResult row : analysis.rows()) {
+                        double straightLineKm = straightLineKmByStaff.getOrDefault(row.staffNumber(), 0.0);
+                        log.info("Upload {} {} carer {}: original {} mi, optimised {} mi, saved {} mi ({}%), straight-line {} mi",
+                                uploadId, reportMonth, row.staffNumber(),
+                                kmToMiles(row.totalOriginalMileageKm()), kmToMiles(row.totalMileageKm()),
+                                kmToMiles(row.totalSavedMileageKm()), savedPercent(row.totalOriginalMileageKm(), row.totalSavedMileageKm()),
+                                kmToMiles(straightLineKm));
+                        totalOriginalKm += row.totalOriginalMileageKm();
+                        totalOptimisedKm += row.totalMileageKm();
+                        totalStraightLineKm += straightLineKm;
+                    }
+
+                    long unique = analysis.visits().stream().map(VisitRow::address).filter(StringUtils::hasText).distinct().count();
+                    log.info("Upload {} {} total for {} carer(s): original {} mi, optimised {} mi, saved {} mi ({}%), straight-line {} mi ({} of {} addresses located)",
+                            uploadId, reportMonth, analysis.rows().size(),
+                            kmToMiles(totalOriginalKm), kmToMiles(totalOptimisedKm),
+                            kmToMiles(totalOriginalKm - totalOptimisedKm), savedPercent(totalOriginalKm, totalOriginalKm - totalOptimisedKm),
+                            kmToMiles(totalStraightLineKm), locations.size(), unique);
+                })
+                .onErrorResume(error -> {
+                    log.warn("Could not log mileage results for upload {} {}: {}", uploadId, reportMonth, error.getMessage());
+                    return Mono.empty();
+                })
+                .then();
+    }
+
+    private double straightLineShiftKm(List<VisitRow> visits, Map<String, Location> locations) {
+        double total = 0.0;
+        for (int i = 1; i < visits.size(); i++) {
+            Location origin = locations.get(visits.get(i - 1).address());
+            Location destination = locations.get(visits.get(i).address());
+            if (origin != null && destination != null) {
+                total += straightLineDistanceKm(origin, destination);
+            }
+        }
+        return total;
+    }
+
+    private double savedPercent(double originalKm, double savedKm) {
+        return originalKm > 0.0 ? roundMileage(savedKm / originalKm * 100.0) : 0.0;
     }
 
     public Mono<List<WorkerMileageTotalResponse>> calculateMonthlyMileageTotals(FilePart file) {
