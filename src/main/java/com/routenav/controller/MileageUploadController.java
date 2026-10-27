@@ -58,8 +58,9 @@ public class MileageUploadController {
     @GetMapping("/uploads")
     public Flux<WorkerMileageUploadResponse> listUploads(
             @RequestParam(name = "date", required = false)
-            @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date) {
-        return mileageUploadService.listUploads(date);
+            @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date,
+            @RequestParam(name = "includeVisits", defaultValue = "false") boolean includeVisits) {
+        return mileageUploadService.listUploads(date, includeVisits);
     }
 
     @GetMapping("/uploads/{id}")
@@ -74,8 +75,9 @@ public class MileageUploadController {
     @GetMapping("/reports")
     public Flux<WorkerMileageReportResponse> listReports(
             @RequestParam(name = "month", required = false) String month,
-            @RequestParam(name = "year", required = false) Integer year) {
-        return mileageUploadService.listReports(month, year);
+            @RequestParam(name = "year", required = false) Integer year,
+            @RequestParam(name = "includeVisits", defaultValue = "false") boolean includeVisits) {
+        return mileageUploadService.listReports(month, year, includeVisits);
     }
 
     @GetMapping("/totals")

@@ -351,13 +351,14 @@ public class MileageUploadService {
                 .then();
     }
 
-    public Flux<WorkerMileageReportResponse> listReports(String reportMonth, Integer year) {
-        return findReports(reportMonth, year).flatMap(this::toReportResponse);
+    public Flux<WorkerMileageReportResponse> listReports(String reportMonth, Integer year, boolean includeVisits) {
+        // One report at a time: building every report's visits at once exhausts the 512MB instance.
+        return findReports(reportMonth, year).concatMap(report -> toReportResponse(report, includeVisits));
     }
 
     public Flux<WorkerMileageTotalResponse> getMileageTotals(String reportMonth, Integer year) {
-        return findReports(reportMonth, year)
-                .flatMap(report -> Mono.zip(
+        return latestReports(reportMonth, year)
+                .concatMap(report -> Mono.zip(
                                 reportRowRepository.findByReportIdOrderByStaffNumberAsc(report.getId()).collectList(),
                                 visitRepository.findByReportIdOrderByStaffNumberAscVisitDateAscStartTimeAsc(report.getId()).collectList())
                         .map(tuple -> new ReportRows(report, tuple.getT1(), tuple.getT2())))
@@ -382,12 +383,13 @@ public class MileageUploadService {
                 });
     }
 
-    public Flux<WorkerMileageUploadResponse> listUploads(LocalDate uploadDate) {
+    public Flux<WorkerMileageUploadResponse> listUploads(LocalDate uploadDate, boolean includeVisits) {
         Flux<WorkerMileageUpload> uploads = uploadDate == null
                 ? uploadRepository.findAllByOrderByCreatedAtDesc()
                 : uploadRepository.findByCreatedAtBetweenOrderByCreatedAtDesc(uploadDate.atStartOfDay(), uploadDate.plusDays(1).atStartOfDay());
 
-        return uploads.flatMap(upload -> getUpload(upload.getId())
+        // One upload at a time: building every upload's visits at once exhausts the 512MB instance.
+        return uploads.concatMap(upload -> getUpload(upload.getId(), includeVisits)
                 .defaultIfEmpty(toUploadResponse(upload, List.of(), false)));
     }
 
@@ -440,6 +442,22 @@ public class MileageUploadService {
         return reports;
     }
 
+    // Only the newest report per month counts, so pick those before loading any rows or visits.
+    private Flux<WorkerMileageReport> latestReports(String reportMonth, Integer year) {
+        return findReports(reportMonth, year)
+                .collectList()
+                .flatMapIterable(reports -> {
+                    Map<String, WorkerMileageReport> latestByMonth = new TreeMap<>();
+                    for (WorkerMileageReport report : reports) {
+                        WorkerMileageReport current = latestByMonth.get(report.getReportMonth());
+                        if (current == null || isNewerReport(report, current)) {
+                            latestByMonth.put(report.getReportMonth(), report);
+                        }
+                    }
+                    return latestByMonth.values();
+                });
+    }
+
     public Mono<WorkerMileageReportResponse> getReport(Long reportId) {
         return reportRepository.findById(reportId).flatMap(this::toReportResponse);
     }
@@ -449,8 +467,8 @@ public class MileageUploadService {
     }
 
     public Mono<byte[]> buildMasterMileageWorkbook(String reportMonth, Integer year) {
-        return findReports(reportMonth, year)
-                .flatMap(report -> Mono.zip(
+        return latestReports(reportMonth, year)
+                .concatMap(report -> Mono.zip(
                                 reportRowRepository.findByReportIdOrderByStaffNumberAsc(report.getId()).collectList(),
                                 visitRepository.findByReportIdOrderByStaffNumberAscVisitDateAscStartTimeAscIdAsc(report.getId()).collectList())
                         .map(tuple -> new ReportRows(report, tuple.getT1(), tuple.getT2())))
@@ -466,8 +484,8 @@ public class MileageUploadService {
     }
 
     public Mono<byte[]> buildOptimisedRoutesWorkbook(String reportMonth, Integer year) {
-        return findReports(reportMonth, year)
-                .flatMap(report -> visitRepository.findByReportIdOrderByStaffNumberAscVisitDateAscStartTimeAscIdAsc(report.getId())
+        return latestReports(reportMonth, year)
+                .concatMap(report -> visitRepository.findByReportIdOrderByStaffNumberAscVisitDateAscStartTimeAscIdAsc(report.getId())
                         .collectList()
                         .map(visits -> new ReportVisits(report, visits)))
                 .collectList()
