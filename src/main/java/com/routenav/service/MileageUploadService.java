@@ -45,6 +45,8 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.HexFormat;
 import java.util.Iterator;
 import com.github.pjfanning.xlsx.StreamingReader;
@@ -85,6 +87,7 @@ public class MileageUploadService {
     private static final double KM_TO_MILES = 0.621371;
     private static final double METERS_PER_KM = 1000.0;
     private static final int EXACT_ROUTE_LIMIT = 12;
+    private static final Pattern UK_POSTCODE = Pattern.compile("([A-Z]{1,2}\\d[A-Z\\d]?)\\s*([\\dO][A-Z]{2})$", Pattern.CASE_INSENSITIVE);
     // Visit times are ignored when optimising, so each carer's whole day is routed as one group.
     private static final String DAY_ROUTE = "Day";
     private static final int BATCH_MAX_DIM = 25;
@@ -761,7 +764,7 @@ public class MileageUploadService {
             originalLegs.add(matrix[i][i + 1]);
         }
         double originalKm = originalLegs.stream().mapToDouble(Double::doubleValue).sum();
-        List<Integer> optIndexes = optimisedIndexes(matrix);
+        List<Integer> optIndexes = postcodeGroupedIndexes(addresses, matrix);
         List<VisitRow> optimisedVisits = optIndexes.stream().map(visits::get).toList();
         List<Double> optimisedLegs = new ArrayList<>();
         for (int i = 0; i < optIndexes.size() - 1; i++) {
@@ -1058,6 +1061,60 @@ public class MileageUploadService {
             throw new IllegalStateException("GOOGLE_API_KEY environment variable is required.");
         }
         return googleApiKey;
+    }
+
+    // Visits sharing a postcode stay together: order the postcode groups by the shortest drive between them,
+    // then within each group start nearest to the previous visit and always drive to the closest next one.
+    private List<Integer> postcodeGroupedIndexes(List<String> addresses, double[][] matrix) {
+        Map<String, List<Integer>> visitsByPostcode = new LinkedHashMap<>();
+        for (int i = 0; i < addresses.size(); i++) {
+            String postcode = postcode(addresses.get(i));
+            visitsByPostcode.computeIfAbsent(postcode == null ? "#" + i : postcode, ignored -> new ArrayList<>()).add(i);
+        }
+        List<List<Integer>> groups = new ArrayList<>(visitsByPostcode.values());
+        if (groups.size() == addresses.size()) {
+            return optimisedIndexes(matrix);
+        }
+
+        double[][] groupMatrix = new double[groups.size()][groups.size()];
+        for (int a = 0; a < groups.size(); a++) {
+            for (int b = 0; b < groups.size(); b++) {
+                if (a == b) {
+                    continue;
+                }
+                double closest = Double.MAX_VALUE;
+                for (int from : groups.get(a)) {
+                    for (int to : groups.get(b)) {
+                        closest = Math.min(closest, matrix[from][to]);
+                    }
+                }
+                groupMatrix[a][b] = closest;
+            }
+        }
+
+        List<Integer> path = new ArrayList<>();
+        for (int group : optimisedIndexes(groupMatrix)) {
+            List<Integer> remaining = new ArrayList<>(groups.get(group));
+            while (!remaining.isEmpty()) {
+                Integer last = path.isEmpty() ? null : path.get(path.size() - 1);
+                Integer next = last == null
+                        ? remaining.get(0)
+                        : remaining.stream().min(Comparator.comparingDouble(candidate -> matrix[last][candidate])).orElseThrow();
+                path.add(next);
+                remaining.remove(next);
+            }
+        }
+        return path;
+    }
+
+    private String postcode(String address) {
+        Matcher matcher = UK_POSTCODE.matcher(address == null ? "" : address.trim());
+        if (!matcher.find()) {
+            return null;
+        }
+        // A letter O typed for the inward zero (e.g. "BT49 OHS") is the same postcode.
+        String inward = matcher.group(2).toUpperCase(Locale.ENGLISH);
+        return matcher.group(1).toUpperCase(Locale.ENGLISH) + " " + (inward.charAt(0) == 'O' ? "0" + inward.substring(1) : inward);
     }
 
     private List<Integer> optimisedIndexes(double[][] matrix) {
