@@ -8,9 +8,8 @@ import reactor.core.publisher.Flux;
 @Repository
 public interface WorkerMileageVisitRepository extends ReactiveCrudRepository<WorkerMileageVisit, Long> {
 
-    Flux<WorkerMileageVisit> findByStaffNumberOrderByVisitDateDescStartTimeDesc(String staffNumber);
+    // Visits are saved in optimised route order, so the id gives the route order within each day.
+    Flux<WorkerMileageVisit> findByStaffNumberOrderByVisitDateDescIdDesc(String staffNumber);
 
-    Flux<WorkerMileageVisit> findByReportIdOrderByStaffNumberAscVisitDateAscStartTimeAsc(Long reportId);
-
-    Flux<WorkerMileageVisit> findByReportIdOrderByStaffNumberAscVisitDateAscStartTimeAscIdAsc(Long reportId);
+    Flux<WorkerMileageVisit> findByReportIdOrderByStaffNumberAscVisitDateAscIdAsc(Long reportId);
 }

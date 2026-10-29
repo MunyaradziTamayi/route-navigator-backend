@@ -84,7 +84,9 @@ public class MileageUploadService {
 
     private static final double KM_TO_MILES = 0.621371;
     private static final double METERS_PER_KM = 1000.0;
-    private static final int EXACT_ROUTE_LIMIT = 9;
+    private static final int EXACT_ROUTE_LIMIT = 12;
+    // Visit times are ignored when optimising, so each carer's whole day is routed as one group.
+    private static final String DAY_ROUTE = "Day";
     private static final int BATCH_MAX_DIM = 25;
     private static final int BATCH_MAX_ELEM = 100;
     private static final int ROUTE_MATRIX_CONCURRENCY = 4;
@@ -200,7 +202,7 @@ public class MileageUploadService {
     }
 
     // Logs each carer's monthly totals so results show in the server logs. Straight-line miles follow the uploaded
-    // visit order within each shift; logging problems never fail the upload.
+    // visit order within each day; logging problems never fail the upload.
     private Mono<Void> logMileageResults(Long uploadId, String reportMonth, AnalysisResult analysis) {
         return Flux.fromIterable(analysis.visits())
                 .map(VisitRow::address)
@@ -360,7 +362,7 @@ public class MileageUploadService {
         return latestReports(reportMonth, year)
                 .concatMap(report -> Mono.zip(
                                 reportRowRepository.findByReportIdOrderByStaffNumberAsc(report.getId()).collectList(),
-                                visitRepository.findByReportIdOrderByStaffNumberAscVisitDateAscStartTimeAsc(report.getId()).collectList())
+                                visitRepository.findByReportIdOrderByStaffNumberAscVisitDateAscIdAsc(report.getId()).collectList())
                         .map(tuple -> new ReportRows(report, tuple.getT1(), tuple.getT2())))
                 .collectList()
                 .flatMapMany(reportRows -> {
@@ -470,7 +472,7 @@ public class MileageUploadService {
         return latestReports(reportMonth, year)
                 .concatMap(report -> Mono.zip(
                                 reportRowRepository.findByReportIdOrderByStaffNumberAsc(report.getId()).collectList(),
-                                visitRepository.findByReportIdOrderByStaffNumberAscVisitDateAscStartTimeAscIdAsc(report.getId()).collectList())
+                                visitRepository.findByReportIdOrderByStaffNumberAscVisitDateAscIdAsc(report.getId()).collectList())
                         .map(tuple -> new ReportRows(report, tuple.getT1(), tuple.getT2())))
                 .collectList()
                 .flatMap(reportRows -> {
@@ -485,7 +487,7 @@ public class MileageUploadService {
 
     public Mono<byte[]> buildOptimisedRoutesWorkbook(String reportMonth, Integer year) {
         return latestReports(reportMonth, year)
-                .concatMap(report -> visitRepository.findByReportIdOrderByStaffNumberAscVisitDateAscStartTimeAscIdAsc(report.getId())
+                .concatMap(report -> visitRepository.findByReportIdOrderByStaffNumberAscVisitDateAscIdAsc(report.getId())
                         .collectList()
                         .map(visits -> new ReportVisits(report, visits)))
                 .collectList()
@@ -500,7 +502,7 @@ public class MileageUploadService {
     }
 
     public Flux<WorkerMileageVisitResponse> getVisitsByStaffNumber(String staffNumber) {
-        return visitRepository.findByStaffNumberOrderByVisitDateDescStartTimeDesc(staffNumber)
+        return visitRepository.findByStaffNumberOrderByVisitDateDescIdDesc(staffNumber)
                 .collectList()
                 .flatMapMany(visits -> toVisitResponsesWithMileage(visits, false));
     }
@@ -719,7 +721,7 @@ public class MileageUploadService {
 
         Map<ShiftKey, List<VisitRow>> visitsByShift = new LinkedHashMap<>();
         for (VisitRow visit : orderedVisits) {
-            visitsByShift.computeIfAbsent(new ShiftKey(visit.staffNumber(), visit.visitDate(), visit.shift()), ignored -> new ArrayList<>()).add(visit);
+            visitsByShift.computeIfAbsent(new ShiftKey(visit.staffNumber(), visit.visitDate(), DAY_ROUTE), ignored -> new ArrayList<>()).add(visit);
         }
 
         // Resolve every distance the month needs up front, then optimise each shift in memory.
@@ -1065,7 +1067,7 @@ public class MileageUploadService {
         return nearestNeighbourThenTwoOpt(matrix);
     }
 
-    // Held-Karp: exact shortest open path over all visits, O(n^2 * 2^n) instead of trying all n! orders.
+    // Held-Karp: exact shortest open path starting at the day's first visit, O(n^2 * 2^n) instead of trying all n! orders.
     private List<Integer> shortestPathExact(double[][] matrix) {
         int n = matrix.length;
         int full = (1 << n) - 1;
@@ -1074,10 +1076,8 @@ public class MileageUploadService {
         for (double[] row : cost) {
             Arrays.fill(row, Double.MAX_VALUE);
         }
-        for (int i = 0; i < n; i++) {
-            cost[1 << i][i] = 0.0;
-            previous[1 << i][i] = -1;
-        }
+        cost[1][0] = 0.0;
+        previous[1][0] = -1;
         for (int mask = 1; mask <= full; mask++) {
             for (int last = 0; last < n; last++) {
                 if ((mask & (1 << last)) == 0 || cost[mask][last] == Double.MAX_VALUE) {
@@ -1114,20 +1114,9 @@ public class MileageUploadService {
         return path;
     }
 
+    // Start from the day's first visit, always go to the closest unvisited address, then let 2-opt remove crossings.
     private List<Integer> nearestNeighbourThenTwoOpt(double[][] matrix) {
-        int n = matrix.length;
-        List<Integer> best = null;
-        double bestTotal = Double.MAX_VALUE;
-        for (int start = 0; start < n; start++) {
-            List<Integer> path = nearestNeighbourPath(matrix, start);
-            path = twoOpt(path, matrix);
-            double total = pathCost(path, matrix);
-            if (total < bestTotal) {
-                bestTotal = total;
-                best = path;
-            }
-        }
-        return best == null ? List.of() : best;
+        return twoOpt(nearestNeighbourPath(matrix, 0), matrix);
     }
 
     private List<Integer> nearestNeighbourPath(double[][] matrix, int start) {
@@ -1367,7 +1356,7 @@ public class MileageUploadService {
             Map<LocalDate, List<Location>> locationsByDay = new LinkedHashMap<>();
             entry.getValue().stream()
                     .sorted(Comparator.comparing(WorkerMileageVisit::getVisitDate)
-                            .thenComparing(WorkerMileageVisit::getStartTime, Comparator.nullsLast(Comparator.naturalOrder())))
+                            .thenComparing(visit -> visit.getId() == null ? 0L : visit.getId()))
                     .filter(visit -> visit.getLat() != null && visit.getLon() != null)
                     .forEach(visit -> locationsByDay.computeIfAbsent(visit.getVisitDate(), ignored -> new ArrayList<>())
                             .add(new Location(visit.getLat(), visit.getLon())));
@@ -2037,7 +2026,8 @@ public class MileageUploadService {
                         .lon(visit.lon())
                         .createdAt(now)
                         .build())
-                .flatMap(visitRepository::save)
+                // Saved one at a time so ids follow the optimised route order.
+                .concatMap(visitRepository::save)
                 .then();
     }
 
@@ -2054,7 +2044,7 @@ public class MileageUploadService {
                     .map(rowResponses -> toReportResponse(report, rowResponses, List.of()));
         }
 
-        Mono<List<WorkerMileageVisit>> visits = visitRepository.findByReportIdOrderByStaffNumberAscVisitDateAscStartTimeAsc(report.getId())
+        Mono<List<WorkerMileageVisit>> visits = visitRepository.findByReportIdOrderByStaffNumberAscVisitDateAscIdAsc(report.getId())
                 .collectList();
 
         return Mono.zip(rows, visits)
@@ -2120,7 +2110,6 @@ public class MileageUploadService {
         List<WorkerMileageVisit> orderedVisits = visits.stream()
                 .sorted(Comparator.comparing(WorkerMileageVisit::getStaffNumber)
                         .thenComparing(WorkerMileageVisit::getVisitDate)
-                        .thenComparing(WorkerMileageVisit::getStartTime, Comparator.nullsLast(Comparator.naturalOrder()))
                         .thenComparing(visit -> visit.getId() == null ? 0L : visit.getId()))
                 .toList();
 
@@ -2132,7 +2121,7 @@ public class MileageUploadService {
                 .concatMap(this::toStaffVisitResponsesWithMileage);
 
         return ascending ? responses : responses.sort(Comparator.comparing(WorkerMileageVisitResponse::getVisitDate).reversed()
-                .thenComparing(WorkerMileageVisitResponse::getStartTime, Comparator.nullsLast(Comparator.reverseOrder())));
+                .thenComparing(visit -> visit.getId() == null ? 0L : visit.getId(), Comparator.reverseOrder()));
     }
 
     private Flux<WorkerMileageVisitResponse> toStaffVisitResponsesWithMileage(List<WorkerMileageVisit> visits) {
